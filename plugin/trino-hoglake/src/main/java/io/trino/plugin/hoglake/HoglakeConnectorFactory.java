@@ -53,6 +53,11 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 public class HoglakeConnectorFactory
         implements ConnectorFactory
 {
+    private static final String MULTI_TENANT_PROPERTY = "hoglake.multi-tenant";
+    private static final String SHARED_REMOTE_READ_PROPERTY = "hoglake.shared.remote-read";
+    private static final String DEDICATED_LOCAL_READ_PROPERTY = "hoglake.dedicated.local-read";
+    private static final Set<String> SESSION_ONLY_S3_PROPERTIES = ImmutableSet.of("s3.region", "s3.endpoint", "s3.path-style-access");
+
     @Override
     public String getName()
     {
@@ -65,13 +70,13 @@ public class HoglakeConnectorFactory
         checkStrictSpiVersionMatch(context, this);
         ClassLoader classLoader = getClass().getClassLoader();
         try (ThreadContextClassLoader _ = new ThreadContextClassLoader(classLoader)) {
-            boolean shared = sharedMode(config);
-            boolean dedicated = dedicatedLocalRead(config);
+            boolean shared = booleanProperty(config, MULTI_TENANT_PROPERTY);
+            boolean dedicated = booleanProperty(config, DEDICATED_LOCAL_READ_PROPERTY);
             if (shared && dedicated) {
                 throw new IllegalArgumentException("hoglake.multi-tenant and hoglake.dedicated.local-read cannot both be enabled");
             }
             if (dedicated) {
-                Map<String, String> properties = dedicatedLocalReadProperties(config);
+                Map<String, String> properties = sessionOnlyS3Properties(config, DEDICATED_LOCAL_READ_PROPERTY);
                 Injector injector = new Bootstrap(
                         "io.trino.bootstrap.catalog." + catalogName,
                         new MBeanModule(),
@@ -85,9 +90,10 @@ public class HoglakeConnectorFactory
                         .initialize();
                 return injector.getInstance(HoglakeDedicatedConnector.class);
             }
+            Map<String, String> effectiveConfig = withoutProperty(config, DEDICATED_LOCAL_READ_PROPERTY);
             if (shared) {
-                if (remoteRead(config)) {
-                    Map<String, String> properties = remoteReadProperties(config);
+                if (booleanProperty(effectiveConfig, SHARED_REMOTE_READ_PROPERTY)) {
+                    Map<String, String> properties = sessionOnlyS3Properties(effectiveConfig, SHARED_REMOTE_READ_PROPERTY);
                     Injector injector = new Bootstrap(
                             "io.trino.bootstrap.catalog." + catalogName,
                             new MBeanModule(),
@@ -107,7 +113,7 @@ public class HoglakeConnectorFactory
                         new ConnectorContextModule(catalogName, context))
                         .doNotInitializeLogging()
                         .disableSystemProperties()
-                        .setRequiredConfigurationProperties(config)
+                        .setRequiredConfigurationProperties(effectiveConfig)
                         .initialize();
                 return injector.getInstance(HoglakeSharedConnector.class);
             }
@@ -120,8 +126,8 @@ public class HoglakeConnectorFactory
                     new ConnectorContextModule(catalogName, context))
                     .doNotInitializeLogging()
                     .disableSystemProperties()
-                    .setOptionalConfigurationProperties(HoglakeFileSystemConfig.defaults(config))
-                    .setRequiredConfigurationProperties(HoglakeFileSystemConfig.normalize(config))
+                    .setOptionalConfigurationProperties(HoglakeFileSystemConfig.defaults(effectiveConfig))
+                    .setRequiredConfigurationProperties(HoglakeFileSystemConfig.normalize(effectiveConfig))
                     .initialize();
 
             return new HoglakeConnector(
@@ -134,59 +140,30 @@ public class HoglakeConnectorFactory
         }
     }
 
-    private static boolean sharedMode(Map<String, String> config)
+    private static boolean booleanProperty(Map<String, String> config, String property)
     {
-        String value = config.get("hoglake.multi-tenant");
+        String value = config.get(property);
         if (value == null || value.equals("false")) {
             return false;
         }
         if (value.equals("true")) {
             return true;
         }
-        throw new IllegalArgumentException("hoglake.multi-tenant must be exactly true or false");
+        throw new IllegalArgumentException("%s must be exactly true or false".formatted(property));
     }
 
-    private static boolean remoteRead(Map<String, String> config)
+    private static Map<String, String> withoutProperty(Map<String, String> config, String property)
     {
-        String value = config.get("hoglake.shared.remote-read");
-        if (value == null || value.equals("false")) {
-            return false;
+        if (!config.containsKey(property)) {
+            return config;
         }
-        if (value.equals("true")) {
-            return true;
-        }
-        throw new IllegalArgumentException("hoglake.shared.remote-read must be exactly true or false");
-    }
-
-    private static boolean dedicatedLocalRead(Map<String, String> config)
-    {
-        String value = config.get("hoglake.dedicated.local-read");
-        if (value == null || value.equals("false")) {
-            return false;
-        }
-        if (value.equals("true")) {
-            return true;
-        }
-        throw new IllegalArgumentException("hoglake.dedicated.local-read must be exactly true or false");
-    }
-
-    private static Map<String, String> dedicatedLocalReadProperties(Map<String, String> config)
-    {
-        for (String name : config.keySet()) {
-            boolean storage = name.startsWith("s3.") || name.startsWith("fs.") || name.startsWith("hoglake.s3.") ||
-                    name.startsWith("gcs.") || name.startsWith("azure.") || name.startsWith("hive.") || name.startsWith("local.");
-            if (storage && !REMOTE_READ_STORAGE_PROPERTIES.contains(name)) {
-                throw new IllegalArgumentException("Configuration property '%s' cannot be set with hoglake.dedicated.local-read".formatted(name));
+        ImmutableMap.Builder<String, String> filtered = ImmutableMap.builder();
+        for (Map.Entry<String, String> entry : config.entrySet()) {
+            if (!entry.getKey().equals(property)) {
+                filtered.put(entry);
             }
         }
-        String region = config.get("s3.region");
-        if (region == null || region.isBlank()) {
-            throw new IllegalArgumentException("s3.region is required with hoglake.dedicated.local-read");
-        }
-        return ImmutableMap.<String, String>builder()
-                .putAll(config)
-                .put("fs.s3.enabled", "true")
-                .buildOrThrow();
+        return filtered.buildOrThrow();
     }
 
     /**
@@ -196,26 +173,24 @@ public class HoglakeConnectorFactory
      * security mapping, a cache or another file system would each be a second
      * source of authority or a store shared between callers.
      */
-    private static Map<String, String> remoteReadProperties(Map<String, String> config)
+    private static Map<String, String> sessionOnlyS3Properties(Map<String, String> config, String modeProperty)
     {
         for (String name : config.keySet()) {
             boolean storage = name.startsWith("s3.") || name.startsWith("fs.") || name.startsWith("hoglake.s3.") ||
                     name.startsWith("gcs.") || name.startsWith("azure.") || name.startsWith("hive.") || name.startsWith("local.");
-            if (storage && !REMOTE_READ_STORAGE_PROPERTIES.contains(name)) {
-                throw new IllegalArgumentException("Configuration property '%s' cannot be set with hoglake.shared.remote-read".formatted(name));
+            if (storage && !SESSION_ONLY_S3_PROPERTIES.contains(name)) {
+                throw new IllegalArgumentException("Configuration property '%s' cannot be set with %s".formatted(name, modeProperty));
             }
         }
         String region = config.get("s3.region");
         if (region == null || region.isBlank()) {
-            throw new IllegalArgumentException("s3.region is required with hoglake.shared.remote-read");
+            throw new IllegalArgumentException("s3.region is required with %s".formatted(modeProperty));
         }
         return ImmutableMap.<String, String>builder()
                 .putAll(config)
                 .put("fs.s3.enabled", "true")
                 .buildOrThrow();
     }
-
-    private static final Set<String> REMOTE_READ_STORAGE_PROPERTIES = Set.of("s3.region", "s3.endpoint", "s3.path-style-access");
 
     private static class SharedModule
             implements Module

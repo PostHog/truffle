@@ -21,6 +21,7 @@ import java.util.UUID;
 import java.util.regex.Pattern;
 
 import static io.trino.spi.StandardErrorCode.PERMISSION_DENIED;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
 
 /**
@@ -274,9 +275,33 @@ final class HoglakeReadSessionContext
         return true;
     }
 
+    static boolean isValidObjectKey(String key)
+    {
+        if (key == null
+                || key.isEmpty()
+                || key.length() > MAX_KEY_LENGTH
+                || key.getBytes(UTF_8).length > MAX_KEY_LENGTH
+                || key.startsWith("/")
+                || key.endsWith("/")) {
+            return false;
+        }
+        for (int index = 0; index < key.length(); index++) {
+            char ch = key.charAt(index);
+            if (ch < 0x20 || ch == 0x7F || ch == '\\' || ch == '*' || ch == '?' || ch == '#') {
+                return false;
+            }
+        }
+        for (String segment : key.split("/", -1)) {
+            if (segment.isEmpty() || segment.equals(".") || segment.equals("..")) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private static boolean isValidStorageTarget(String bucket, String region, String objectKey)
     {
-        return isValidBucket(bucket) && isValidRegion(region) && isValidKey(objectKey, false);
+        return isValidBucket(bucket) && isValidRegion(region) && isValidObjectKey(objectKey);
     }
 
     private static StorageLocation parseS3Location(String location)

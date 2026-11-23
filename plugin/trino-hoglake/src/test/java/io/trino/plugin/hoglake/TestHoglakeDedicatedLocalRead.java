@@ -32,6 +32,7 @@ import io.trino.parquet.writer.ParquetWriterOptions;
 import io.trino.plugin.hoglake.rest.HoglakeClient;
 import io.trino.plugin.hoglake.testing.ConnectorTestFixtures;
 import io.trino.plugin.hoglake.testing.ConnectorTestFixtures.FileColumn;
+import io.trino.plugin.hoglake.testing.PuffinDeletionVectorFixtures;
 import io.trino.spi.Plugin;
 import io.trino.spi.SplitWeight;
 import io.trino.spi.TrinoException;
@@ -77,6 +78,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -672,6 +674,237 @@ final class TestHoglakeDedicatedLocalRead
     }
 
     @Test
+    void testWorkerRealS3DeletionVectorHeadForbiddenIsRedacted()
+            throws Exception
+    {
+        KeyPair key = keyPair();
+        Path jwksFile = directory.resolve("s3-dv-head-denied-jwks.json");
+        writeJwks(jwksFile, key, KID);
+
+        CallerFixture liveAlice = callerAt(key, Instant.now(), "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSLIVE", "SECRETLIVE", "TOKENLIVE");
+        byte[] parquetBytes = writeMetricsParquet(List.of(101L, 202L, 303L), List.of("alpha", "beta", "gamma"));
+        String dataPath = liveAlice.tableFile("metrics/part-0.parquet");
+        String deletePath = liveAlice.tableFile("metrics/part-0.puffin");
+        String dataRequestPath = "/example-customer/catalog-a/tables/metrics/part-0.parquet";
+        String deleteRequestPath = "/example-customer/catalog-a/tables/metrics/part-0.puffin";
+        List<RecordedRequest> s3Requests = new CopyOnWriteArrayList<>();
+
+        // Serve the Parquet file normally and deny the deletion vector HEAD with a bodyless HTTP 403.
+        try (DedicatedTestServer s3Server = DedicatedTestServer.start(s3Requests, request -> {
+            if (request.rawPath().equals(dataRequestPath)) {
+                return serveS3Object(request, parquetBytes);
+            }
+            if (request.rawPath().equals(deleteRequestPath)) {
+                return Response.bodyless(403);
+            }
+            return Response.bodyless(404);
+        });
+                DedicatedTestServer metadataServer = DedicatedTestServer.start(new CopyOnWriteArrayList<>(), _ -> new Response(404, "{}"))) {
+            Map<String, String> properties = ImmutableMap.<String, String>builder()
+                    .put("hoglake.uri", metadataServer.baseUri().toASCIIString())
+                    .put("hoglake.dedicated.local-read", "true")
+                    .put("hoglake.dedicated.jwks-file", jwksFile.toString())
+                    .put("hoglake.dedicated.issuer", ISSUER)
+                    .put("hoglake.dedicated.remote-targets", EVENTS_TARGET + "," + IMPORTS_TARGET)
+                    .put("hoglake.dedicated.hoglite-backends", BACKEND_ID)
+                    .put("s3.region", REGION)
+                    .put("s3.endpoint", s3Server.baseUri().toASCIIString())
+                    .put("s3.path-style-access", "true")
+                    .buildOrThrow();
+
+            ConnectorSession liveSession = querySession(liveAlice.mappedUser(), liveAlice.principal(), liveAlice.jwt(), "reports")
+                    .toConnectorSession(CATALOG_HANDLE);
+
+            Connector connector = new HoglakeConnectorFactory().create("hoglake", properties, new TestingConnectorContext());
+            try {
+                ConnectorTransactionHandle tx = connector.beginTransaction(READ_COMMITTED, true, true);
+                HoglakeTableHandle handle = localHandle("reports", "metrics", 5L, ALICE_TABLE_UUID);
+                HoglakeSplit split = localSplit(dataPath, parquetBytes.length, Optional.of(deletePath));
+                assertRedactedDenial(
+                        () -> {
+                            try (ConnectorPageSource pageSource = connector.getPageSourceProvider().createPageSource(
+                                    tx,
+                                    liveSession,
+                                    split,
+                                    handle,
+                                    Optional.empty(),
+                                    List.of(new HoglakeColumnHandle("id", 1, BIGINT, false)),
+                                    DynamicFilter.EMPTY,
+                                    MemoryContext.NO_LIMIT)) {
+                                while (!pageSource.isFinished()) {
+                                    pageSource.getNextSourcePage();
+                                }
+                            }
+                            catch (IOException failure) {
+                                throw new RuntimeException(failure);
+                            }
+                        },
+                        TARGET_DENIED,
+                        "example-customer",
+                        dataPath,
+                        deletePath,
+                        liveAlice.jwt(),
+                        liveAlice.accessKey(),
+                        liveAlice.secretKey(),
+                        liveAlice.sessionToken());
+            }
+            finally {
+                connector.shutdown();
+            }
+
+            assertThat(s3Requests).anySatisfy(request -> {
+                assertThat(request.method()).isEqualTo("HEAD");
+                assertThat(request.rawPath()).isEqualTo(deleteRequestPath);
+                assertThat(request.authorization()).contains("Credential=ACCESSLIVE/");
+                assertThat(request.securityToken()).isEqualTo("TOKENLIVE");
+            });
+        }
+    }
+
+    @Test
+    void testEndToEndRealParquetReadWithInGrantDeletionVector()
+            throws Exception
+    {
+        KeyPair key = keyPair();
+        Path jwksFile = directory.resolve("dv-read-jwks.json");
+        writeJwks(jwksFile, key, KID);
+
+        CallerFixture alice = caller(key, "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSA", "SECRETA", "TOKENA");
+        byte[] parquetBytes = writeMetricsParquet(List.of(101L, 202L, 303L), List.of("alpha", "beta", "gamma"));
+        String dataPath = alice.tableFile("metrics/part-0.parquet");
+        String deletePath = alice.tableFile("metrics/part-0.puffin");
+        byte[] deletionVectorBytes = PuffinDeletionVectorFixtures.deletionVector(dataPath, 1L);
+
+        CredentialCheckingFileSystemFactory fileSystems = new CredentialCheckingFileSystemFactory(
+                Map.of(alice.credentials(), Map.of(
+                        dataPath, parquetBytes,
+                        deletePath, deletionVectorBytes)));
+
+        List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
+        try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> routeLocalTable(
+                request,
+                alice.catalog(),
+                "reports",
+                "metrics",
+                ALICE_TABLE_UUID,
+                5L,
+                dataPath,
+                parquetBytes.length,
+                999L,
+                deletePath));
+                HoglakeDedicatedReadPath readPath = new HoglakeDedicatedReadPath(
+                        server.baseUri(),
+                        Duration.ofSeconds(10),
+                        verifier(jwksFile),
+                        fileSystems);
+                StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+            Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "reports");
+
+            MaterializedResult rows = runner.execute(session, "SELECT id, label FROM hoglake.reports.metrics ORDER BY id");
+            assertThat(rows.getMaterializedRows())
+                    .extracting(row -> List.of(row.getField(0), row.getField(1)))
+                    .containsExactly(
+                            List.of(101L, "alpha"),
+                            List.of(303L, "gamma"));
+
+            MaterializedResult count = runner.execute(session, "SELECT count(*) FROM hoglake.reports.metrics");
+            assertThat(count.getOnlyValue()).isEqualTo(2L);
+        }
+
+        // Assert Alice's exact JWT AWS credentials opened both the Parquet file and the deletion vector.
+        assertThat(fileSystems.reads()).anySatisfy(read -> {
+            assertThat(read.credentials()).isEqualTo(alice.credentials());
+            assertThat(read.location()).isEqualTo(dataPath);
+        });
+        assertThat(fileSystems.reads()).anySatisfy(read -> {
+            assertThat(read.credentials()).isEqualTo(alice.credentials());
+            assertThat(read.location()).isEqualTo(deletePath);
+        });
+        assertThat(fileSystems.reads()).allSatisfy(read -> {
+            assertThat(read.credentials()).isEqualTo(alice.credentials());
+            assertThat(read.location()).isIn(dataPath, deletePath);
+        });
+    }
+
+    @Test
+    void testRepeatedTableLookupAndSelfJoinReusePinnedHandle()
+            throws Exception
+    {
+        KeyPair key = keyPair();
+        Path jwksFile = directory.resolve("self-join-jwks.json");
+        writeJwks(jwksFile, key, KID);
+
+        CallerFixture alice = caller(key, "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSA", "SECRETA", "TOKENA");
+        byte[] parquetBytes = writeMetricsParquet(List.of(101L, 202L, 303L), List.of("alpha", "beta", "gamma"));
+        String dataPath = alice.tableFile("metrics/part-0.parquet");
+        String tableRoute = "/v1/catalogs/" + alice.catalog() + "/namespaces/reports/tables/metrics";
+        String pinnedScanRoute = tableRoute + "/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID;
+
+        for (boolean dropAfterFirstLookup : List.of(false, true)) {
+            CredentialCheckingFileSystemFactory fileSystems = new CredentialCheckingFileSystemFactory(
+                    Map.of(alice.credentials(), Map.of(dataPath, parquetBytes)));
+            AtomicInteger tableLookups = new AtomicInteger();
+            List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
+
+            try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> {
+                if (request.rawPathAndQuery().equals(tableRoute)) {
+                    int lookup = tableLookups.incrementAndGet();
+                    if (lookup > 1) {
+                        if (dropAfterFirstLookup) {
+                            return new Response(404, "{}");
+                        }
+                        return routeLocalTable(request, alice.catalog(), "reports", "metrics", BOB_TABLE_UUID, 6L, dataPath, parquetBytes.length, 3L, null);
+                    }
+                }
+                return routeLocalTable(request, alice.catalog(), "reports", "metrics", ALICE_TABLE_UUID, 5L, dataPath, parquetBytes.length, 3L, null);
+            });
+                    HoglakeDedicatedReadPath readPath = new HoglakeDedicatedReadPath(
+                            server.baseUri(),
+                            Duration.ofSeconds(10),
+                            verifier(jwksFile),
+                            fileSystems);
+                    StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "reports");
+                ConnectorSession connectorSession = session.toConnectorSession(CATALOG_HANDLE);
+
+                // Direct repeated getTableHandle in one transaction reuses the pinned handle without another HTTP call.
+                ConnectorTransactionHandle tx = new HoglakeTransactionHandle(UUID.randomUUID());
+                try {
+                    ConnectorMetadata metadata = readPath.metadata(connectorSession, tx);
+                    SchemaTableName metrics = new SchemaTableName("reports", "metrics");
+                    ConnectorTableHandle first = metadata.getTableHandle(connectorSession, metrics, Optional.empty(), Optional.empty());
+                    ConnectorTableHandle second = metadata.getTableHandle(connectorSession, metrics, Optional.empty(), Optional.empty());
+                    assertThat(second).isEqualTo(first);
+                    assertThat(((HoglakeTableHandle) second).snapshotId()).isEqualTo(5L);
+                    assertThat(((HoglakeTableHandle) second).tableUuid()).isEqualTo(ALICE_TABLE_UUID);
+                    assertThat(tableLookups.get()).isEqualTo(1);
+                }
+                finally {
+                    readPath.end(tx);
+                }
+
+                // End-to-end self-join succeeds in one transaction even when the table advances or disappears after lookup 1.
+                tableLookups.set(0);
+                requests.clear();
+                MaterializedResult joined = runner.execute(
+                        session,
+                        "SELECT a.id, b.label FROM hoglake.reports.metrics a JOIN hoglake.reports.metrics b ON a.id = b.id ORDER BY a.id");
+                assertThat(joined.getMaterializedRows())
+                        .extracting(row -> List.of(row.getField(0), row.getField(1)))
+                        .containsExactly(
+                                List.of(101L, "alpha"),
+                                List.of(202L, "beta"),
+                                List.of(303L, "gamma"));
+                assertThat(tableLookups.get()).isEqualTo(1);
+                assertThat(requests).filteredOn(request -> request.rawPathAndQuery().equals(tableRoute)).hasSize(1);
+                assertThat(requests).filteredOn(request -> request.rawPath().endsWith("/scan"))
+                        .isNotEmpty()
+                        .allSatisfy(request -> assertThat(request.rawPathAndQuery()).isEqualTo(pinnedScanRoute));
+            }
+        }
+    }
+
+    @Test
     void testConnectorFactoryDedicatedLocalReadIsDefaultOffAndIsolated()
             throws Exception
     {
@@ -818,9 +1051,9 @@ final class TestHoglakeDedicatedLocalRead
                         "path": "%s",
                         "delete_count": 1,
                         "file_size_bytes": 16,
-                        "file_format": "roaring_bitmap"
+                        "file_format": "%s"
                       }
-                      """.formatted(deletePath);
+                      """.formatted(deletePath, HoglakeDeletionVector.PUFFIN_DELETION_VECTOR_FORMAT);
             return new Response(200,
                     """
                     [
@@ -944,16 +1177,21 @@ final class TestHoglakeDedicatedLocalRead
 
     private static HoglakeSplit localSplit(String dataPath, Optional<String> deletePath)
     {
+        return localSplit(dataPath, 128L, deletePath);
+    }
+
+    private static HoglakeSplit localSplit(String dataPath, long fileSizeBytes, Optional<String> deletePath)
+    {
         return new HoglakeSplit(
                 1L,
                 dataPath,
-                128L,
+                fileSizeBytes,
                 -1L,
                 deletePath,
                 deletePath.isPresent() ? 1L : 0L,
-                deletePath.map(_ -> "roaring_bitmap"),
+                deletePath.map(_ -> HoglakeDeletionVector.PUFFIN_DELETION_VECTOR_FORMAT),
                 0L,
-                128L,
+                fileSizeBytes,
                 SplitWeight.standard(),
                 OptionalLong.empty(),
                 Optional.empty());
@@ -1153,14 +1391,65 @@ final class TestHoglakeDedicatedLocalRead
         }
     }
 
-    private record RecordedRequest(String method, String rawPath, String rawPathAndQuery, String authorization, String securityToken) {}
+    private record RecordedRequest(String method, String rawPath, String rawPathAndQuery, String authorization, String securityToken, String range) {}
 
-    private record Response(int status, String contentType, String body)
+    private record Response(int status, String contentType, byte[] body, Map<String, String> headers)
     {
         Response(int status, String body)
         {
-            this(status, "application/json", body);
+            this(status, "application/json", body.getBytes(UTF_8), Map.of());
         }
+
+        Response(int status, String contentType, String body)
+        {
+            this(status, contentType, body.getBytes(UTF_8), Map.of());
+        }
+
+        static Response bodyless(int status)
+        {
+            return new Response(status, "application/octet-stream", null, Map.of());
+        }
+
+        static Response bodyless(int status, Map<String, String> headers)
+        {
+            return new Response(status, "application/octet-stream", null, headers);
+        }
+
+        static Response bytes(int status, String contentType, byte[] body, Map<String, String> headers)
+        {
+            return new Response(status, contentType, body, headers);
+        }
+    }
+
+    private static Response serveS3Object(RecordedRequest request, byte[] content)
+    {
+        if (request.method().equals("HEAD")) {
+            return Response.bodyless(200, Map.of("Content-Length", Integer.toString(content.length)));
+        }
+        String range = request.range();
+        if (range != null && range.startsWith("bytes=")) {
+            String[] bounds = range.substring("bytes=".length()).split("-", 2);
+            int start;
+            int end;
+            if (bounds[0].isEmpty()) {
+                int suffix = Integer.parseInt(bounds[1]);
+                start = Math.max(0, content.length - suffix);
+                end = content.length - 1;
+            }
+            else {
+                start = Integer.parseInt(bounds[0]);
+                end = bounds[1].isEmpty()
+                        ? content.length - 1
+                        : Math.min(Integer.parseInt(bounds[1]), content.length - 1);
+            }
+            byte[] slice = Arrays.copyOfRange(content, start, end + 1);
+            return Response.bytes(
+                    206,
+                    "application/octet-stream",
+                    slice,
+                    Map.of("Content-Range", "bytes %d-%d/%d".formatted(start, end, content.length)));
+        }
+        return Response.bytes(200, "application/octet-stream", content, Map.of());
     }
 
     private static final class DedicatedTestServer
@@ -1205,11 +1494,18 @@ final class TestHoglakeDedicatedLocalRead
                     rawPath,
                     rawPathAndQuery,
                     exchange.getRequestHeaders().getFirst("Authorization"),
-                    exchange.getRequestHeaders().getFirst("X-Amz-Security-Token"));
+                    exchange.getRequestHeaders().getFirst("X-Amz-Security-Token"),
+                    exchange.getRequestHeaders().getFirst("Range"));
             recorded.add(request);
             Response response = handler.apply(request);
-            byte[] bytes = response.body().getBytes(UTF_8);
             exchange.getResponseHeaders().set("Content-Type", response.contentType());
+            response.headers().forEach((name, value) -> exchange.getResponseHeaders().set(name, value));
+            if (exchange.getRequestMethod().equals("HEAD") || response.body() == null) {
+                exchange.sendResponseHeaders(response.status(), -1);
+                exchange.close();
+                return;
+            }
+            byte[] bytes = response.body();
             exchange.sendResponseHeaders(response.status(), bytes.length);
             try (OutputStream output = exchange.getResponseBody()) {
                 output.write(bytes);

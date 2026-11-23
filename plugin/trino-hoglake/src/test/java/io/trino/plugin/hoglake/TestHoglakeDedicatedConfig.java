@@ -17,20 +17,32 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import io.airlift.configuration.ConfigurationFactory;
 import io.airlift.units.Duration;
+import io.trino.spi.connector.Connector;
+import io.trino.testing.TestingConnectorContext;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.net.URI;
+import java.nio.file.Path;
 import java.util.Map;
 
 import static io.airlift.configuration.testing.ConfigAssertions.assertFullMapping;
 import static io.airlift.configuration.testing.ConfigAssertions.assertRecordedDefaults;
 import static io.airlift.configuration.testing.ConfigAssertions.recordDefaults;
+import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.BACKEND_ID;
+import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.ISSUER;
+import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.keyPair;
+import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.writeJwks;
 import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 final class TestHoglakeDedicatedConfig
 {
+    @TempDir
+    Path directory;
+
     @Test
     void testDefaults()
     {
@@ -89,5 +101,68 @@ final class TestHoglakeDedicatedConfig
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Invalid dedicated Hoglake URI")
                 .hasNoCause();
+    }
+
+    @Test
+    void testExplicitDedicatedLocalReadFalseBootsLegacyAndSharedConnectors()
+            throws Exception
+    {
+        Path jwksFile = directory.resolve("shared-jwks.json");
+        writeJwks(jwksFile, keyPair(), "synthetic-shared-key");
+
+        Connector legacy = new HoglakeConnectorFactory().create(
+                "hoglake",
+                Map.of(
+                        "hoglake.uri", "https://metadata.example.test",
+                        "hoglake.s3.region", "us-east-1",
+                        "hoglake.dedicated.local-read", "false"),
+                new TestingConnectorContext());
+        try {
+            assertThat(legacy).isInstanceOf(HoglakeConnector.class);
+        }
+        finally {
+            legacy.shutdown();
+        }
+
+        Map<String, String> sharedMetadataConfig = ImmutableMap.<String, String>builder()
+                .put("hoglake.uri", "https://metadata.example.test")
+                .put("hoglake.multi-tenant", "true")
+                .put("hoglake.dedicated.local-read", "false")
+                .put("hoglake.shared.jwks-file", jwksFile.toString())
+                .put("hoglake.shared.issuer", ISSUER)
+                .put("hoglake.shared.backend-bindings", "{\"%s\":\"hoglite\"}".formatted(BACKEND_ID))
+                .buildOrThrow();
+
+        Connector sharedMetadata = new HoglakeConnectorFactory().create("hoglake", sharedMetadataConfig, new TestingConnectorContext());
+        try {
+            assertThat(sharedMetadata).isInstanceOf(HoglakeSharedConnector.class);
+        }
+        finally {
+            sharedMetadata.shutdown();
+        }
+
+        Map<String, String> sharedRemoteReadConfig = ImmutableMap.<String, String>builder()
+                .putAll(sharedMetadataConfig)
+                .put("hoglake.shared.remote-read", "true")
+                .put("s3.region", "us-east-1")
+                .buildOrThrow();
+
+        Connector sharedRemoteRead = new HoglakeConnectorFactory().create("hoglake", sharedRemoteReadConfig, new TestingConnectorContext());
+        try {
+            assertThat(sharedRemoteRead).isInstanceOf(HoglakeSharedConnector.class);
+        }
+        finally {
+            sharedRemoteRead.shutdown();
+        }
+
+        assertThatThrownBy(() -> new HoglakeConnectorFactory().create(
+                "hoglake",
+                Map.of(
+                        "hoglake.uri", "https://metadata.example.test",
+                        "hoglake.s3.region", "us-east-1",
+                        "hoglake.dedicated.local-read", "false",
+                        "hoglake.dedicated.issuer", ISSUER),
+                new TestingConnectorContext()))
+                .isInstanceOf(RuntimeException.class);
     }
 }

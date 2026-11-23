@@ -207,11 +207,7 @@ final class HoglakeDedicatedReadPath
     static RuntimeException storageDenial(RuntimeException failure)
     {
         for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
-            // Check by class name because the AWS SDK belongs to the filesystem dependency.
-            String name = cause.getClass().getName();
-            if (name.equals("software.amazon.awssdk.services.s3.model.AccessDeniedException")
-                    || cause instanceof java.nio.file.AccessDeniedException
-                    || cause instanceof AccessDeniedException) {
+            if (isStorageAccessDenied(cause)) {
                 return targetDenied();
             }
             if (cause.getCause() == cause) {
@@ -219,6 +215,36 @@ final class HoglakeDedicatedReadPath
             }
         }
         return failure;
+    }
+
+    private static boolean isStorageAccessDenied(Throwable cause)
+    {
+        if (cause instanceof java.nio.file.AccessDeniedException
+                || cause instanceof AccessDeniedException) {
+            return true;
+        }
+        // Check AWS SDK classes by name because the SDK belongs to the filesystem dependency.
+        String name = cause.getClass().getName();
+        if (name.equals("software.amazon.awssdk.services.s3.model.AccessDeniedException")) {
+            return true;
+        }
+        return isS3ForbiddenException(cause);
+    }
+
+    private static boolean isS3ForbiddenException(Throwable cause)
+    {
+        for (Class<?> type = cause.getClass(); type != null; type = type.getSuperclass()) {
+            if (type.getName().equals("software.amazon.awssdk.services.s3.model.S3Exception")) {
+                try {
+                    Object status = type.getMethod("statusCode").invoke(cause);
+                    return Integer.valueOf(403).equals(status);
+                }
+                catch (ReflectiveOperationException _) {
+                    return false;
+                }
+            }
+        }
+        return false;
     }
 
     void end(ConnectorTransactionHandle transaction)
@@ -393,8 +419,8 @@ final class HoglakeDedicatedReadPath
     private static HoglakeTableHandle validateLocalTableHandle(ConnectorTableHandle table, Reader reader)
     {
         HoglakeTableHandle handle = validateLocalTableHandle(table);
-        TablePin pin = reader.pinnedTables().get(handle.schemaTableName());
-        if (pin != null && (pin.snapshotId() != handle.snapshotId() || !pin.tableUuid().equals(handle.tableUuid()))) {
+        HoglakeTableHandle pinned = reader.pinnedTables().get(handle.schemaTableName());
+        if (pinned != null && (pinned.snapshotId() != handle.snapshotId() || !pinned.tableUuid().equals(handle.tableUuid()))) {
             throw localTableDenied();
         }
         return handle;
@@ -520,13 +546,11 @@ final class HoglakeDedicatedReadPath
         return new TrinoException(NOT_SUPPORTED, "Dedicated Hoglake local read is read-only");
     }
 
-    private record TablePin(long snapshotId, String tableUuid) {}
-
     private record Reader(
             String token,
             HoglakeReadSessionContext context,
             HoglakeClient client,
-            Map<SchemaTableName, TablePin> pinnedTables)
+            Map<SchemaTableName, HoglakeTableHandle> pinnedTables)
     {
         HoglakeClient clientFor(ConnectorSession session)
         {
@@ -645,6 +669,10 @@ final class HoglakeDedicatedReadPath
             if (startVersion.isPresent() || endVersion.isPresent()) {
                 throw new TrinoException(NOT_SUPPORTED, "Table versioning is not supported by dedicated Hoglake local read");
             }
+            HoglakeTableHandle cached = reader.pinnedTables().get(tableName);
+            if (cached != null) {
+                return cached;
+            }
             Optional<HoglakeDtos.Table> found = reader.clientFor(session)
                     .getTable(tableName.getSchemaName(), tableName.getTableName());
             if (found.isEmpty()) {
@@ -664,12 +692,6 @@ final class HoglakeDedicatedReadPath
                 throw localTableDenied();
             }
 
-            TablePin pin = new TablePin(table.readSnapshotId(), table.tableUuid());
-            TablePin existing = reader.pinnedTables().putIfAbsent(tableName, pin);
-            if (existing != null && !existing.equals(pin)) {
-                throw localTableDenied();
-            }
-
             List<HoglakeColumnHandle> columns = table.columns().stream()
                     .map(HoglakeDedicatedReadPath::toColumnHandle)
                     .collect(toImmutableList());
@@ -677,11 +699,11 @@ final class HoglakeDedicatedReadPath
                     || columns.stream().map(HoglakeColumnHandle::name).distinct().count() != columns.size()) {
                 throw localTableDenied();
             }
-            return new HoglakeTableHandle(
+            HoglakeTableHandle handle = new HoglakeTableHandle(
                     tableName.getSchemaName(),
                     tableName.getTableName(),
-                    pin.snapshotId(),
-                    pin.tableUuid(),
+                    table.readSnapshotId(),
+                    table.tableUuid(),
                     columns,
                     TupleDomain.all(),
                     ImmutableList.of(),
@@ -689,6 +711,8 @@ final class HoglakeDedicatedReadPath
                     false,
                     OptionalLong.empty(),
                     false);
+            HoglakeTableHandle existing = reader.pinnedTables().putIfAbsent(tableName, handle);
+            return existing != null ? existing : handle;
         }
 
         @Override

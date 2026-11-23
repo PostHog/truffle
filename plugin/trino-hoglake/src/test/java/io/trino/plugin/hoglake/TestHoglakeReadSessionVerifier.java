@@ -555,9 +555,12 @@ final class TestHoglakeReadSessionVerifier
         // Prefix grants allow descendants and enforce strict prefix boundaries.
         assertThat(context.allowsStorageTarget("example-remote", REGION, "events/team_id=4/part-0.parquet")).isTrue();
         assertThat(context.allowsStorageTarget("example-remote", REGION, "events/team_id=4/2026/11/part-1.parquet")).isTrue();
+        assertThat(context.allowsStorageTarget("example-remote", REGION, "events/team_id=4/part(1).parquet")).isTrue();
         assertThat(context.allowsStorageTarget(EVENTS_TARGET, "example-remote", REGION, "events/team_id=4/part-0.parquet")).isTrue();
+        assertThat(context.allowsStorageTarget(EVENTS_TARGET, "example-remote", REGION, "events/team_id=4/part(1).parquet")).isTrue();
         assertThat(context.allowsStorageTarget(IMPORTS_TARGET, "example-remote", REGION, "imports/team_id=4/part-0.parquet")).isTrue();
         assertThat(context.allowsStorageLocation(EVENTS_TARGET, "s3://example-remote/events/team_id=4/part-0.parquet", REGION)).isTrue();
+        assertThat(context.allowsStorageLocation(EVENTS_TARGET, "s3://example-remote/events/team_id=4/part(1).parquet", REGION)).isTrue();
 
         // Prefix boundary (team_id=4/ vs team_id=42/), sibling prefix, wrong bucket, wrong region, and path traversal.
         List<String> deniedKeys = List.of(
