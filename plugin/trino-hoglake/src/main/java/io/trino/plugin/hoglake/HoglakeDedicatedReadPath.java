@@ -1,0 +1,1449 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.trino.plugin.hoglake;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import io.airlift.slice.Slice;
+import io.trino.filesystem.FileIterator;
+import io.trino.filesystem.Location;
+import io.trino.filesystem.TrinoFileSystem;
+import io.trino.filesystem.TrinoFileSystemFactory;
+import io.trino.filesystem.TrinoInputFile;
+import io.trino.filesystem.TrinoOutputFile;
+import io.trino.plugin.hoglake.HoglakeReadSessionContext.StorageSession;
+import io.trino.plugin.hoglake.rest.HoglakeClient;
+import io.trino.plugin.hoglake.rest.HoglakeDtos;
+import io.trino.plugin.hoglake.rest.HoglakeTokenSource;
+import io.trino.spi.RefreshType;
+import io.trino.spi.SplitWeight;
+import io.trino.spi.TrinoException;
+import io.trino.spi.connector.AggregateFunction;
+import io.trino.spi.connector.AggregationApplicationResult;
+import io.trino.spi.connector.BeginTableExecuteResult;
+import io.trino.spi.connector.ColumnHandle;
+import io.trino.spi.connector.ColumnMetadata;
+import io.trino.spi.connector.ConnectorAccessControl;
+import io.trino.spi.connector.ConnectorAnalyzeMetadata;
+import io.trino.spi.connector.ConnectorInsertTableHandle;
+import io.trino.spi.connector.ConnectorMergeTableHandle;
+import io.trino.spi.connector.ConnectorMetadata;
+import io.trino.spi.connector.ConnectorOutputMetadata;
+import io.trino.spi.connector.ConnectorOutputTableHandle;
+import io.trino.spi.connector.ConnectorPageSource;
+import io.trino.spi.connector.ConnectorPageSourceProvider;
+import io.trino.spi.connector.ConnectorPartitioningHandle;
+import io.trino.spi.connector.ConnectorSession;
+import io.trino.spi.connector.ConnectorSplit;
+import io.trino.spi.connector.ConnectorSplitManager;
+import io.trino.spi.connector.ConnectorSplitSource;
+import io.trino.spi.connector.ConnectorTableCredentials;
+import io.trino.spi.connector.ConnectorTableExecuteHandle;
+import io.trino.spi.connector.ConnectorTableHandle;
+import io.trino.spi.connector.ConnectorTableLayout;
+import io.trino.spi.connector.ConnectorTableMetadata;
+import io.trino.spi.connector.ConnectorTableProperties;
+import io.trino.spi.connector.ConnectorTableVersion;
+import io.trino.spi.connector.ConnectorTransactionHandle;
+import io.trino.spi.connector.ConnectorWritableTableHandle;
+import io.trino.spi.connector.Constraint;
+import io.trino.spi.connector.ConstraintApplicationResult;
+import io.trino.spi.connector.DynamicFilter;
+import io.trino.spi.connector.FixedSplitSource;
+import io.trino.spi.connector.JoinApplicationResult;
+import io.trino.spi.connector.JoinStatistics;
+import io.trino.spi.connector.JoinType;
+import io.trino.spi.connector.LimitApplicationResult;
+import io.trino.spi.connector.MemoryContext;
+import io.trino.spi.connector.ProjectionApplicationResult;
+import io.trino.spi.connector.RelationColumnsMetadata;
+import io.trino.spi.connector.RelationCommentMetadata;
+import io.trino.spi.connector.RetryMode;
+import io.trino.spi.connector.RowChangeParadigm;
+import io.trino.spi.connector.SampleApplicationResult;
+import io.trino.spi.connector.SampleType;
+import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.connector.SchemaTablePrefix;
+import io.trino.spi.connector.SortItem;
+import io.trino.spi.connector.SourcePage;
+import io.trino.spi.connector.TableColumnsMetadata;
+import io.trino.spi.connector.TableFunctionApplicationResult;
+import io.trino.spi.connector.TableScanRedirectApplicationResult;
+import io.trino.spi.connector.TopNApplicationResult;
+import io.trino.spi.expression.ConnectorExpression;
+import io.trino.spi.expression.Constant;
+import io.trino.spi.function.table.ConnectorTableFunctionHandle;
+import io.trino.spi.metrics.Metrics;
+import io.trino.spi.predicate.TupleDomain;
+import io.trino.spi.security.AccessDeniedException;
+import io.trino.spi.security.ConnectorIdentity;
+import io.trino.spi.statistics.ComputedStatistics;
+import io.trino.spi.statistics.TableStatistics;
+import io.trino.spi.statistics.TableStatisticsMetadata;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.UnaryOperator;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static com.google.common.collect.ImmutableList.toImmutableList;
+import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_ACCESS_KEY_PROPERTY;
+import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_SECRET_KEY_PROPERTY;
+import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_SESSION_TOKEN_PROPERTY;
+import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
+import static io.trino.spi.StandardErrorCode.PERMISSION_DENIED;
+import static java.util.Locale.ENGLISH;
+import static java.util.Objects.requireNonNull;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+
+/**
+ * Dedicated local table read path backed by offline read session verification.
+ * Each transaction uses only the caller's verified JWT and AWS session credentials.
+ */
+final class HoglakeDedicatedReadPath
+        implements AutoCloseable
+{
+    private static final String AUTHORITY_DENIED = "Dedicated Hoglake read session authority is invalid or unavailable";
+    private static final String TARGET_DENIED = "Dedicated Hoglake read session does not allow this storage target";
+    private static final String REQUEST_DENIED = "Dedicated Hoglake read session does not allow this request";
+    private static final String LOCAL_TABLE_DENIED = "Dedicated Hoglake local read requires a valid pinned local table";
+
+    private static final Pattern NAMESPACE_ROUTE = Pattern.compile("/namespaces/([^/]+)");
+    private static final Pattern TABLE_ROUTE = Pattern.compile("/namespaces/([^/]+)/tables/([^/]+)");
+    private static final Pattern SCAN_ROUTE = Pattern.compile("/namespaces/([^/]+)/tables/([^/]+)/scan");
+    private static final Pattern NON_NEGATIVE_INTEGER = Pattern.compile("0|[1-9][0-9]*");
+
+    private final HoglakeReadSessionVerifier verifier;
+    private final String baseUri;
+    private final String basePath;
+    private final Duration requestTimeout;
+    private final HttpClient httpClient;
+    private final TrinoFileSystemFactory sessionFileSystems;
+    private final ConnectorSplitManager splitManager;
+    private final ConnectorPageSourceProvider pageSourceProvider;
+    private final Map<ConnectorTransactionHandle, Reader> readers = new ConcurrentHashMap<>();
+
+    HoglakeDedicatedReadPath(HoglakeDedicatedConfig config, HoglakeReadSessionVerifier verifier, TrinoFileSystemFactory fileSystemFactory)
+    {
+        this(config.getUri(),
+                Duration.ofNanos(config.getRequestTimeout().roundTo(NANOSECONDS)),
+                verifier,
+                fileSystemFactory);
+    }
+
+    HoglakeDedicatedReadPath(URI baseUri, Duration requestTimeout, HoglakeReadSessionVerifier verifier, TrinoFileSystemFactory fileSystemFactory)
+    {
+        this.verifier = requireNonNull(verifier, "verifier is null");
+        this.baseUri = HoglakeClient.validateBaseUri(requireNonNull(baseUri, "baseUri is null").toASCIIString()).toString();
+        String path = URI.create(this.baseUri).getRawPath();
+        this.basePath = path == null ? "" : path;
+        this.requestTimeout = requireNonNull(requestTimeout, "requestTimeout is null");
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(HttpClient.Redirect.NEVER)
+                .build();
+        this.sessionFileSystems = new DedicatedSessionFileSystemFactory(
+                verifier,
+                requireNonNull(fileSystemFactory, "fileSystemFactory is null"));
+        this.splitManager = new DedicatedSplitManager();
+        // Disable footer and data caches so workers never share state across callers.
+        this.pageSourceProvider = new DedicatedPageSourceProvider(verifier, new HoglakePageSourceProvider(sessionFileSystems));
+    }
+
+    ConnectorMetadata metadata(ConnectorSession session, ConnectorTransactionHandle transaction)
+    {
+        reader(session, transaction);
+        return new DedicatedMetadata(transaction);
+    }
+
+    ConnectorSplitManager splitManager()
+    {
+        return splitManager;
+    }
+
+    ConnectorPageSourceProvider pageSourceProvider()
+    {
+        return pageSourceProvider;
+    }
+
+    TrinoFileSystemFactory sessionFileSystems()
+    {
+        return sessionFileSystems;
+    }
+
+    HoglakeClient.RouteGuard routeGuard(String verifiedCatalog)
+    {
+        return createRouteGuard(basePath, verifiedCatalog);
+    }
+
+    /**
+     * Translate S3 access denial exceptions into a redacted permission error.
+     */
+    static RuntimeException storageDenial(RuntimeException failure)
+    {
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            // Check by class name because the AWS SDK belongs to the filesystem dependency.
+            String name = cause.getClass().getName();
+            if (name.equals("software.amazon.awssdk.services.s3.model.AccessDeniedException")
+                    || cause instanceof java.nio.file.AccessDeniedException
+                    || cause instanceof AccessDeniedException) {
+                return targetDenied();
+            }
+            if (cause.getCause() == cause) {
+                break;
+            }
+        }
+        return failure;
+    }
+
+    void end(ConnectorTransactionHandle transaction)
+    {
+        Reader reader = readers.remove(transaction);
+        if (reader != null) {
+            reader.client().close();
+        }
+    }
+
+    @Override
+    public void close()
+    {
+        readers.clear();
+        httpClient.shutdownNow();
+    }
+
+    private Reader reader(ConnectorSession session, ConnectorTransactionHandle transaction)
+    {
+        HoglakeReadSessionContext context = verifier.verify(session);
+        Reader reader = readers.computeIfAbsent(transaction, _ -> newReader(context));
+        if (!reader.token().equals(context.token())) {
+            throw authorityDenied();
+        }
+        return reader;
+    }
+
+    private Reader newReader(HoglakeReadSessionContext context)
+    {
+        HoglakeClient client = new HoglakeClient(
+                baseUri,
+                context.catalog(),
+                requestTimeout,
+                new HoglakeTokenSource.Fixed(context.token()),
+                httpClient,
+                createRouteGuard(basePath, context.catalog()));
+        return new Reader(context.token(), context, client, new ConcurrentHashMap<>());
+    }
+
+    static HoglakeClient.RouteGuard createRouteGuard(String basePath, String verifiedCatalog)
+    {
+        requireNonNull(basePath, "basePath is null");
+        requireNonNull(verifiedCatalog, "verifiedCatalog is null");
+        String catalogPath = basePath + "/v1/catalogs/" + verifiedCatalog;
+        return (method, uri) -> {
+            if (!"GET".equals(method) || uri == null || uri.getRawFragment() != null) {
+                throw requestDenied();
+            }
+            String rawPath = uri.getRawPath();
+            if (rawPath == null || !rawPath.startsWith(catalogPath)) {
+                throw requestDenied();
+            }
+            String suffix = rawPath.substring(catalogPath.length());
+            String rawQuery = uri.getRawQuery();
+
+            Matcher namespaceMatch = NAMESPACE_ROUTE.matcher(suffix);
+            if (namespaceMatch.matches()) {
+                if (!isValidSegment(namespaceMatch.group(1)) || rawQuery != null) {
+                    throw requestDenied();
+                }
+                return;
+            }
+
+            Matcher tableMatch = TABLE_ROUTE.matcher(suffix);
+            if (tableMatch.matches()) {
+                if (!isValidSegment(tableMatch.group(1)) || !isValidSegment(tableMatch.group(2)) || rawQuery != null) {
+                    throw requestDenied();
+                }
+                return;
+            }
+
+            Matcher scanMatch = SCAN_ROUTE.matcher(suffix);
+            if (scanMatch.matches()) {
+                if (!isValidSegment(scanMatch.group(1)) || !isValidSegment(scanMatch.group(2)) || !isValidPinnedScanQuery(rawQuery)) {
+                    throw requestDenied();
+                }
+                return;
+            }
+
+            throw requestDenied();
+        };
+    }
+
+    private static boolean isValidSegment(String segment)
+    {
+        if (segment == null || segment.isEmpty() || segment.equals(".") || segment.equals("..")) {
+            return false;
+        }
+        String lower = segment.toLowerCase(ENGLISH);
+        return !lower.contains("%2f") && !lower.contains("%5c");
+    }
+
+    private static boolean isValidPinnedScanQuery(String rawQuery)
+    {
+        if (rawQuery == null || rawQuery.isEmpty()) {
+            return false;
+        }
+        String[] pairs = rawQuery.split("&", -1);
+        if (pairs.length != 2) {
+            return false;
+        }
+        String snapshotValue = null;
+        String tableUuidValue = null;
+        for (String pair : pairs) {
+            int separator = pair.indexOf('=');
+            if (separator <= 0 || separator >= pair.length() - 1) {
+                return false;
+            }
+            String name = pair.substring(0, separator);
+            String value = pair.substring(separator + 1);
+            if (name.equals("snapshot")) {
+                if (snapshotValue != null) {
+                    return false;
+                }
+                snapshotValue = value;
+            }
+            else if (name.equals("table_uuid")) {
+                if (tableUuidValue != null) {
+                    return false;
+                }
+                tableUuidValue = value;
+            }
+            else {
+                return false;
+            }
+        }
+        if (snapshotValue == null || tableUuidValue == null) {
+            return false;
+        }
+        if (!NON_NEGATIVE_INTEGER.matcher(snapshotValue).matches()) {
+            return false;
+        }
+        try {
+            if (Long.parseLong(snapshotValue) < 0) {
+                return false;
+            }
+        }
+        catch (NumberFormatException _) {
+            return false;
+        }
+        return isCanonicalUuid(tableUuidValue);
+    }
+
+    private static boolean isCanonicalUuid(String value)
+    {
+        if (value == null || value.isEmpty()) {
+            return false;
+        }
+        try {
+            return UUID.fromString(value).toString().equals(value);
+        }
+        catch (IllegalArgumentException _) {
+            return false;
+        }
+    }
+
+    private static HoglakeTableHandle validateLocalTableHandle(ConnectorTableHandle table)
+    {
+        if (!(table instanceof HoglakeTableHandle handle)) {
+            throw localTableDenied();
+        }
+        if (handle.remote()
+                || handle.snapshotId() < 0
+                || !isCanonicalUuid(handle.tableUuid())
+                || !handle.stagedFiles().isEmpty()
+                || !handle.stagedDeletes().isEmpty()) {
+            throw localTableDenied();
+        }
+        return handle;
+    }
+
+    private static HoglakeTableHandle validateLocalTableHandle(ConnectorTableHandle table, Reader reader)
+    {
+        HoglakeTableHandle handle = validateLocalTableHandle(table);
+        TablePin pin = reader.pinnedTables().get(handle.schemaTableName());
+        if (pin != null && (pin.snapshotId() != handle.snapshotId() || !pin.tableUuid().equals(handle.tableUuid()))) {
+            throw localTableDenied();
+        }
+        return handle;
+    }
+
+    private static List<HoglakeSplit> toLocalSplits(List<HoglakeDtos.ScanFile> scanFiles, long maxSplitSize)
+    {
+        ImmutableList.Builder<HoglakeSplit> splits = ImmutableList.builder();
+        for (HoglakeDtos.ScanFile file : scanFiles) {
+            HoglakeDtos.DataFile dataFile = file.dataFile();
+            OptionalLong footerSize = dataFile.footerSize() == null ? OptionalLong.empty() : OptionalLong.of(dataFile.footerSize());
+            HoglakeDtos.DeleteFile deleteFile = file.deleteFile();
+            Optional<String> deletePath = deleteFile == null ? Optional.empty() : Optional.of(deleteFile.path());
+            long deleteCount = deleteFile == null ? 0 : deleteFile.deleteCount();
+            Optional<String> deleteFormat = deleteFile == null ? Optional.empty() : Optional.ofNullable(deleteFile.fileFormat());
+
+            // Leave recordCount negative so count queries always read the Parquet file.
+            HoglakeSplit wholeFile = new HoglakeSplit(
+                    dataFile.dataFileId(),
+                    dataFile.path(),
+                    dataFile.fileSizeBytes(),
+                    -1,
+                    deletePath,
+                    deleteCount,
+                    deleteFormat,
+                    0,
+                    dataFile.fileSizeBytes(),
+                    SplitWeight.standard(),
+                    footerSize,
+                    Optional.empty());
+            long fileSizeBytes = dataFile.fileSizeBytes();
+            if (fileSizeBytes <= maxSplitSize) {
+                splits.add(wholeFile);
+                continue;
+            }
+            for (HoglakeSplitManager.ByteRange range : HoglakeSplitManager.planRanges(fileSizeBytes, footerSize, dataFile.splitOffsets(), maxSplitSize)) {
+                splits.add(wholeFile.withRange(
+                        range.start(),
+                        range.length(),
+                        HoglakeSplitManager.splitWeight(range.length(), maxSplitSize),
+                        Optional.empty()));
+            }
+        }
+        return splits.build();
+    }
+
+    private static HoglakeSplit stripMetadataCount(HoglakeSplit split)
+    {
+        if (split.recordCount() < 0 && split.affinityKey().isEmpty()) {
+            return split;
+        }
+        return new HoglakeSplit(
+                split.dataFileId(),
+                split.path(),
+                split.fileSizeBytes(),
+                -1,
+                split.deleteFilePath(),
+                split.deleteCount(),
+                split.deleteFileFormat(),
+                split.start(),
+                split.length(),
+                split.splitWeight(),
+                split.footerSize(),
+                Optional.empty());
+    }
+
+    private static HoglakeTableHandle stripMetadataCount(HoglakeTableHandle handle)
+    {
+        if (!handle.countOnly() && handle.recordCount().isEmpty()) {
+            return handle;
+        }
+        return new HoglakeTableHandle(
+                handle.schemaName(),
+                handle.tableName(),
+                handle.snapshotId(),
+                handle.tableUuid(),
+                handle.columns(),
+                handle.constraint(),
+                ImmutableList.of(),
+                ImmutableList.of(),
+                false,
+                OptionalLong.empty(),
+                false);
+    }
+
+    private static HoglakeColumnHandle toColumnHandle(HoglakeDtos.Column column)
+    {
+        try {
+            return HoglakeMetadata.toColumnHandle(column);
+        }
+        catch (RuntimeException _) {
+            throw new TrinoException(NOT_SUPPORTED, "Dedicated Hoglake column metadata is not supported");
+        }
+    }
+
+    private static TrinoException authorityDenied()
+    {
+        return new TrinoException(PERMISSION_DENIED, AUTHORITY_DENIED);
+    }
+
+    private static TrinoException targetDenied()
+    {
+        return new TrinoException(PERMISSION_DENIED, TARGET_DENIED);
+    }
+
+    private static TrinoException requestDenied()
+    {
+        return new TrinoException(PERMISSION_DENIED, REQUEST_DENIED);
+    }
+
+    private static TrinoException localTableDenied()
+    {
+        return new TrinoException(PERMISSION_DENIED, LOCAL_TABLE_DENIED);
+    }
+
+    private static TrinoException listingDenied()
+    {
+        return new TrinoException(NOT_SUPPORTED, "Dedicated Hoglake local read does not support catalog listing");
+    }
+
+    private static TrinoException writeDenied()
+    {
+        return new TrinoException(NOT_SUPPORTED, "Dedicated Hoglake local read is read-only");
+    }
+
+    private record TablePin(long snapshotId, String tableUuid) {}
+
+    private record Reader(
+            String token,
+            HoglakeReadSessionContext context,
+            HoglakeClient client,
+            Map<SchemaTableName, TablePin> pinnedTables)
+    {
+        HoglakeClient clientFor(ConnectorSession session)
+        {
+            return client.forQuery(session.getQueryId());
+        }
+
+        @Override
+        public String toString()
+        {
+            return "Reader{redacted}";
+        }
+    }
+
+    private final class DedicatedSplitManager
+            implements ConnectorSplitManager
+    {
+        @Override
+        public ConnectorSplitSource getSplits(
+                ConnectorTransactionHandle transaction,
+                ConnectorSession session,
+                ConnectorTableHandle table,
+                Set<ColumnHandle> dynamicFilterColumns,
+                Constraint constraint)
+        {
+            Reader reader = reader(session, transaction);
+            HoglakeTableHandle handle = validateLocalTableHandle(table, reader);
+            if (handle.constraint().isNone() || constraint.getSummary().isNone()) {
+                return new FixedSplitSource(ImmutableList.of());
+            }
+
+            List<HoglakeDtos.ScanFile> scanFiles = reader.clientFor(session)
+                    .scanPinned(handle.schemaName(), handle.tableName(), handle.snapshotId(), handle.tableUuid());
+
+            HoglakeReadSessionContext context = reader.context();
+            String primaryCatalog = context.catalog();
+            String region = context.storage().region();
+
+            // Validate every returned file and deletion vector before emitting any split.
+            for (HoglakeDtos.ScanFile file : scanFiles) {
+                if (file == null || file.dataFile() == null) {
+                    throw localTableDenied();
+                }
+                HoglakeDtos.DataFile dataFile = file.dataFile();
+                context.requireStorageLocation(primaryCatalog, dataFile.path(), region);
+                if (dataFile.fileSizeBytes() < 0) {
+                    throw localTableDenied();
+                }
+                HoglakeDtos.DeleteFile deleteFile = file.deleteFile();
+                if (deleteFile != null) {
+                    context.requireStorageLocation(primaryCatalog, deleteFile.path(), region);
+                    if (deleteFile.dataFileId() != dataFile.dataFileId()) {
+                        throw localTableDenied();
+                    }
+                }
+            }
+
+            long maxSplitSize = HoglakeSessionProperties.getMaxSplitSize(session).toBytes();
+            return new FixedSplitSource(toLocalSplits(scanFiles, maxSplitSize));
+        }
+
+        @Override
+        public ConnectorSplitSource getSplits(
+                ConnectorTransactionHandle transaction,
+                ConnectorSession session,
+                ConnectorTableFunctionHandle function)
+        {
+            verifier.verify(session);
+            throw writeDenied();
+        }
+    }
+
+    private final class DedicatedMetadata
+            implements ConnectorMetadata
+    {
+        private final ConnectorTransactionHandle transaction;
+
+        private DedicatedMetadata(ConnectorTransactionHandle transaction)
+        {
+            this.transaction = requireNonNull(transaction, "transaction is null");
+        }
+
+        @Override
+        public boolean schemaExists(ConnectorSession session, String schemaName)
+        {
+            Reader reader = reader(session, transaction);
+            if (schemaName == null || !schemaName.equals(schemaName.toLowerCase(ENGLISH))) {
+                return false;
+            }
+            return reader.clientFor(session).findNamespace(schemaName)
+                    .filter(namespace -> schemaName.equals(namespace.name()) && !namespace.isRemote())
+                    .isPresent();
+        }
+
+        @Override
+        public List<String> listSchemaNames(ConnectorSession session)
+        {
+            reader(session, transaction);
+            throw listingDenied();
+        }
+
+        @Override
+        public List<SchemaTableName> listTables(ConnectorSession session, Optional<String> schemaName)
+        {
+            reader(session, transaction);
+            throw listingDenied();
+        }
+
+        @Override
+        public ConnectorTableHandle getTableHandle(
+                ConnectorSession session,
+                SchemaTableName tableName,
+                Optional<ConnectorTableVersion> startVersion,
+                Optional<ConnectorTableVersion> endVersion)
+        {
+            Reader reader = reader(session, transaction);
+            if (startVersion.isPresent() || endVersion.isPresent()) {
+                throw new TrinoException(NOT_SUPPORTED, "Table versioning is not supported by dedicated Hoglake local read");
+            }
+            Optional<HoglakeDtos.Table> found = reader.clientFor(session)
+                    .getTable(tableName.getSchemaName(), tableName.getTableName());
+            if (found.isEmpty()) {
+                return null;
+            }
+            HoglakeDtos.Table table = found.get();
+            if (table.isRemote()) {
+                throw localTableDenied();
+            }
+            if (!tableName.getSchemaName().equals(table.namespace())
+                    || !tableName.getTableName().equals(table.name())
+                    || !isCanonicalUuid(table.tableUuid())
+                    || table.readSnapshotId() == null
+                    || table.readSnapshotId() < 0
+                    || table.columns() == null
+                    || table.columns().isEmpty()) {
+                throw localTableDenied();
+            }
+
+            TablePin pin = new TablePin(table.readSnapshotId(), table.tableUuid());
+            TablePin existing = reader.pinnedTables().putIfAbsent(tableName, pin);
+            if (existing != null && !existing.equals(pin)) {
+                throw localTableDenied();
+            }
+
+            List<HoglakeColumnHandle> columns = table.columns().stream()
+                    .map(HoglakeDedicatedReadPath::toColumnHandle)
+                    .collect(toImmutableList());
+            if (columns.stream().anyMatch(column -> column.name() == null || column.name().isBlank())
+                    || columns.stream().map(HoglakeColumnHandle::name).distinct().count() != columns.size()) {
+                throw localTableDenied();
+            }
+            return new HoglakeTableHandle(
+                    tableName.getSchemaName(),
+                    tableName.getTableName(),
+                    pin.snapshotId(),
+                    pin.tableUuid(),
+                    columns,
+                    TupleDomain.all(),
+                    ImmutableList.of(),
+                    ImmutableList.of(),
+                    false,
+                    OptionalLong.empty(),
+                    false);
+        }
+
+        @Override
+        public ConnectorTableMetadata getTableMetadata(ConnectorSession session, ConnectorTableHandle table)
+        {
+            Reader reader = reader(session, transaction);
+            HoglakeTableHandle handle = validateLocalTableHandle(table, reader);
+            return new ConnectorTableMetadata(
+                    handle.schemaTableName(),
+                    handle.columns().stream()
+                            .map(HoglakeColumnHandle::columnMetadata)
+                            .collect(toImmutableList()));
+        }
+
+        @Override
+        public Map<String, ColumnHandle> getColumnHandles(ConnectorSession session, ConnectorTableHandle tableHandle)
+        {
+            Reader reader = reader(session, transaction);
+            HoglakeTableHandle handle = validateLocalTableHandle(tableHandle, reader);
+            ImmutableMap.Builder<String, ColumnHandle> columns = ImmutableMap.builder();
+            for (HoglakeColumnHandle column : handle.columns()) {
+                columns.put(column.name(), column);
+            }
+            return columns.buildOrThrow();
+        }
+
+        @Override
+        public ColumnMetadata getColumnMetadata(ConnectorSession session, ConnectorTableHandle tableHandle, ColumnHandle columnHandle)
+        {
+            Reader reader = reader(session, transaction);
+            validateLocalTableHandle(tableHandle, reader);
+            return ((HoglakeColumnHandle) columnHandle).columnMetadata();
+        }
+
+        @Override
+        public TableStatistics getTableStatistics(ConnectorSession session, ConnectorTableHandle tableHandle)
+        {
+            Reader reader = reader(session, transaction);
+            validateLocalTableHandle(tableHandle, reader);
+            return TableStatistics.empty();
+        }
+
+        @Override
+        public ConnectorTableProperties getTableProperties(ConnectorSession session, ConnectorTableHandle table)
+        {
+            Reader reader = reader(session, transaction);
+            validateLocalTableHandle(table, reader);
+            return ConnectorMetadata.super.getTableProperties(session, table);
+        }
+
+        @Override
+        public Optional<ConstraintApplicationResult<ConnectorTableHandle>> applyFilter(ConnectorSession session, ConnectorTableHandle table, Constraint constraint)
+        {
+            Reader reader = reader(session, transaction);
+            HoglakeTableHandle handle = validateLocalTableHandle(table, reader);
+            TupleDomain<HoglakeColumnHandle> predicate = handle.constraint()
+                    .intersect(constraint.getSummary().transformKeys(HoglakeColumnHandle.class::cast));
+            if (predicate.equals(handle.constraint())) {
+                return Optional.empty();
+            }
+            return Optional.of(new ConstraintApplicationResult<>(
+                    handle.withConstraint(predicate),
+                    constraint.getSummary(),
+                    constraint.getExpression(),
+                    false));
+        }
+
+        @Override
+        public Optional<ProjectionApplicationResult<ConnectorTableHandle>> applyProjection(
+                ConnectorSession session,
+                ConnectorTableHandle table,
+                List<ConnectorExpression> projections,
+                Map<String, ColumnHandle> assignments)
+        {
+            Reader reader = reader(session, transaction);
+            HoglakeTableHandle handle = validateLocalTableHandle(table, reader);
+            if (projections.isEmpty()) {
+                // Keep count queries on the Parquet read path instead of metadata counts.
+                return Optional.empty();
+            }
+            return HoglakeVariantProjections.applyProjection(handle, projections, assignments);
+        }
+
+        @Override
+        public Optional<LimitApplicationResult<ConnectorTableHandle>> applyLimit(ConnectorSession session, ConnectorTableHandle handle, long limit)
+        {
+            Reader reader = reader(session, transaction);
+            validateLocalTableHandle(handle, reader);
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<SampleApplicationResult<ConnectorTableHandle>> applySample(ConnectorSession session, ConnectorTableHandle handle, SampleType sampleType, double sampleRatio)
+        {
+            Reader reader = reader(session, transaction);
+            validateLocalTableHandle(handle, reader);
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<AggregationApplicationResult<ConnectorTableHandle>> applyAggregation(
+                ConnectorSession session,
+                ConnectorTableHandle handle,
+                List<AggregateFunction> aggregates,
+                Map<String, ColumnHandle> assignments,
+                List<List<ColumnHandle>> groupingSets)
+        {
+            Reader reader = reader(session, transaction);
+            validateLocalTableHandle(handle, reader);
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<JoinApplicationResult<ConnectorTableHandle>> applyJoin(
+                ConnectorSession session,
+                JoinType joinType,
+                ConnectorTableHandle left,
+                ConnectorTableHandle right,
+                ConnectorExpression joinCondition,
+                Map<String, ColumnHandle> leftAssignments,
+                Map<String, ColumnHandle> rightAssignments,
+                JoinStatistics statistics)
+        {
+            Reader reader = reader(session, transaction);
+            validateLocalTableHandle(left, reader);
+            validateLocalTableHandle(right, reader);
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<TopNApplicationResult<ConnectorTableHandle>> applyTopN(
+                ConnectorSession session,
+                ConnectorTableHandle handle,
+                long topNCount,
+                List<SortItem> sortItems,
+                Map<String, ColumnHandle> assignments)
+        {
+            Reader reader = reader(session, transaction);
+            validateLocalTableHandle(handle, reader);
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<TableFunctionApplicationResult<ConnectorTableHandle>> applyTableFunction(ConnectorSession session, ConnectorTableFunctionHandle handle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public void validateScan(ConnectorSession session, ConnectorTableHandle handle)
+        {
+            Reader reader = reader(session, transaction);
+            validateLocalTableHandle(handle, reader);
+        }
+
+        @Override
+        public Optional<TableScanRedirectApplicationResult> applyTableScanRedirect(ConnectorSession session, ConnectorTableHandle tableHandle)
+        {
+            Reader reader = reader(session, transaction);
+            validateLocalTableHandle(tableHandle, reader);
+            return Optional.empty();
+        }
+
+        @Override
+        public boolean allowSplittingReadIntoMultipleSubQueries(ConnectorSession session, ConnectorTableHandle tableHandle)
+        {
+            Reader reader = reader(session, transaction);
+            validateLocalTableHandle(tableHandle, reader);
+            return false;
+        }
+
+        @Override
+        public Optional<ConnectorTableCredentials> getTableCredentials(ConnectorSession session, ConnectorTableHandle tableHandle)
+        {
+            Reader reader = reader(session, transaction);
+            validateLocalTableHandle(tableHandle, reader);
+            return Optional.empty();
+        }
+
+        @Override
+        public Iterator<RelationColumnsMetadata> streamRelationColumns(
+                ConnectorSession session,
+                Optional<String> schemaName,
+                UnaryOperator<Set<SchemaTableName>> relationFilter)
+        {
+            reader(session, transaction);
+            throw listingDenied();
+        }
+
+        @Override
+        public Iterator<RelationCommentMetadata> streamRelationComments(
+                ConnectorSession session,
+                Optional<String> schemaName,
+                UnaryOperator<Set<SchemaTableName>> relationFilter)
+        {
+            reader(session, transaction);
+            throw listingDenied();
+        }
+
+        @SuppressWarnings("deprecation")
+        @Override
+        public Map<SchemaTableName, List<ColumnMetadata>> listTableColumns(ConnectorSession session, SchemaTablePrefix prefix)
+        {
+            reader(session, transaction);
+            throw listingDenied();
+        }
+
+        @SuppressWarnings("deprecation")
+        @Override
+        public Iterator<TableColumnsMetadata> streamTableColumns(ConnectorSession session, SchemaTablePrefix prefix)
+        {
+            reader(session, transaction);
+            throw listingDenied();
+        }
+
+        @Override
+        public Optional<ConnectorTableExecuteHandle> getTableHandleForExecute(
+                ConnectorSession session,
+                ConnectorAccessControl accessControl,
+                ConnectorTableHandle tableHandle,
+                String procedureName,
+                Map<String, Object> executeProperties,
+                RetryMode retryMode)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorTableExecuteHandle> getTableHandleForMaterializedViewExecute(
+                ConnectorSession session,
+                ConnectorAccessControl accessControl,
+                ConnectorTableHandle tableHandle,
+                String procedureName,
+                Map<String, Object> executeProperties,
+                RetryMode retryMode)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Set<ColumnHandle> getColumnHandlesForTableExecute(
+                ConnectorSession session,
+                ConnectorTableHandle tableHandle,
+                ConnectorTableExecuteHandle connectorTableExecuteHandle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorTableLayout> getLayoutForTableExecute(ConnectorSession session, ConnectorTableExecuteHandle tableExecuteHandle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public BeginTableExecuteResult<ConnectorTableExecuteHandle, ConnectorTableHandle> beginTableExecute(
+                ConnectorSession session,
+                ConnectorTableExecuteHandle tableExecuteHandle,
+                ConnectorTableHandle updatedSourceTableHandle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Map<String, Long> finishTableExecute(
+                ConnectorSession session,
+                ConnectorTableExecuteHandle tableExecuteHandle,
+                Collection<Slice> fragments,
+                List<Object> tableExecuteState)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Map<String, Long> executeTableExecute(ConnectorSession session, ConnectorTableExecuteHandle tableExecuteHandle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorTableLayout> getNewTableLayout(ConnectorSession session, ConnectorTableMetadata tableMetadata)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorTableLayout> getInsertLayout(ConnectorSession session, ConnectorTableHandle tableHandle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public TableStatisticsMetadata getStatisticsCollectionMetadataForWrite(ConnectorSession session, ConnectorTableMetadata tableMetadata, boolean tableReplace)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public ConnectorAnalyzeMetadata getStatisticsCollectionMetadata(ConnectorSession session, ConnectorTableHandle tableHandle, Map<String, Object> analyzeProperties)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public ConnectorTableHandle beginStatisticsCollection(ConnectorSession session, ConnectorTableHandle tableHandle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public void finishStatisticsCollection(ConnectorSession session, ConnectorTableHandle tableHandle, Collection<ComputedStatistics> computedStatistics)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public ConnectorOutputTableHandle beginCreateTable(ConnectorSession session, ConnectorTableMetadata tableMetadata, Optional<ConnectorTableLayout> layout, RetryMode retryMode, boolean replace)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorOutputMetadata> finishCreateTable(
+                ConnectorSession session,
+                ConnectorOutputTableHandle tableHandle,
+                Collection<Slice> fragments,
+                Collection<ComputedStatistics> computedStatistics)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public ConnectorInsertTableHandle beginInsert(ConnectorSession session, ConnectorTableHandle tableHandle, List<ColumnHandle> columns, RetryMode retryMode)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorOutputMetadata> finishInsert(
+                ConnectorSession session,
+                ConnectorInsertTableHandle insertHandle,
+                List<ConnectorTableHandle> sourceTableHandles,
+                Collection<Slice> fragments,
+                Collection<ComputedStatistics> computedStatistics)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public ConnectorInsertTableHandle beginRefreshMaterializedView(
+                ConnectorSession session,
+                ConnectorTableHandle tableHandle,
+                List<ConnectorTableHandle> sourceTableHandles,
+                boolean hasForeignSourceTables,
+                RetryMode retryMode,
+                RefreshType refreshType)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorOutputMetadata> finishRefreshMaterializedView(
+                ConnectorSession session,
+                ConnectorTableHandle tableHandle,
+                ConnectorInsertTableHandle insertHandle,
+                Collection<Slice> fragments,
+                Collection<ComputedStatistics> computedStatistics,
+                List<ConnectorTableHandle> sourceTableHandles,
+                boolean hasForeignSourceTables,
+                boolean hasSourceTableFunctions,
+                boolean hasNonDeterministicFunctions)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public RowChangeParadigm getRowChangeParadigm(ConnectorSession session, ConnectorTableHandle tableHandle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public ColumnHandle getMergeRowIdColumnHandle(ConnectorSession session, ConnectorTableHandle tableHandle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorPartitioningHandle> getUpdateLayout(ConnectorSession session, ConnectorTableHandle tableHandle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public ConnectorMergeTableHandle beginMerge(
+                ConnectorSession session,
+                ConnectorTableHandle tableHandle,
+                Map<Integer, Collection<ColumnHandle>> updateCaseColumns,
+                RetryMode retryMode)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorOutputMetadata> finishMerge(
+                ConnectorSession session,
+                ConnectorMergeTableHandle mergeTableHandle,
+                List<ConnectorTableHandle> sourceTableHandles,
+                Collection<Slice> fragments,
+                Collection<ComputedStatistics> computedStatistics)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorOutputMetadata> finishMerge(
+                ConnectorSession session,
+                ConnectorMergeTableHandle mergeTableHandle,
+                List<ConnectorTableHandle> sourceTableHandles,
+                Collection<Slice> fragments,
+                Collection<ComputedStatistics> computedStatistics,
+                MemoryContext memoryContext)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorTableHandle> applyUpdate(ConnectorSession session, ConnectorTableHandle handle, Map<ColumnHandle, Constant> assignments)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public OptionalLong executeUpdate(ConnectorSession session, ConnectorTableHandle handle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorTableHandle> applyDelete(ConnectorSession session, ConnectorTableHandle handle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public OptionalLong executeDelete(ConnectorSession session, ConnectorTableHandle handle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorTableCredentials> getTableCredentials(ConnectorSession session, ConnectorWritableTableHandle tableHandle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+
+        @Override
+        public Optional<ConnectorTableCredentials> getTableCredentials(ConnectorSession session, ConnectorTableFunctionHandle tableFunctionHandle)
+        {
+            reader(session, transaction);
+            throw writeDenied();
+        }
+    }
+
+    private static final class DedicatedPageSourceProvider
+            implements ConnectorPageSourceProvider
+    {
+        private final HoglakeReadSessionVerifier verifier;
+        private final ConnectorPageSourceProvider delegate;
+
+        private DedicatedPageSourceProvider(HoglakeReadSessionVerifier verifier, ConnectorPageSourceProvider delegate)
+        {
+            this.verifier = requireNonNull(verifier, "verifier is null");
+            this.delegate = requireNonNull(delegate, "delegate is null");
+        }
+
+        @Override
+        public ConnectorPageSource createPageSource(
+                ConnectorTransactionHandle transaction,
+                ConnectorSession session,
+                ConnectorSplit split,
+                ConnectorTableHandle table,
+                Optional<ConnectorTableCredentials> tableCredentials,
+                List<ColumnHandle> columns,
+                DynamicFilter dynamicFilter,
+                MemoryContext memoryContext)
+        {
+            HoglakeReadSessionContext context = verifier.verify(session);
+            HoglakeTableHandle handle = validateLocalTableHandle(table);
+            if (!(split instanceof HoglakeSplit hoglakeSplit)) {
+                throw localTableDenied();
+            }
+
+            String primaryCatalog = context.catalog();
+            String region = context.storage().region();
+            context.requireStorageLocation(primaryCatalog, hoglakeSplit.path(), region);
+            if (hoglakeSplit.deleteFilePath().isPresent()) {
+                context.requireStorageLocation(primaryCatalog, hoglakeSplit.deleteFilePath().orElseThrow(), region);
+            }
+
+            HoglakeSplit localSplit = stripMetadataCount(hoglakeSplit);
+            HoglakeTableHandle localTable = stripMetadataCount(handle);
+            try {
+                ConnectorPageSource pageSource = delegate.createPageSource(
+                        transaction,
+                        session,
+                        localSplit,
+                        localTable,
+                        tableCredentials,
+                        columns,
+                        dynamicFilter,
+                        memoryContext);
+                return new RedactingPageSource(pageSource);
+            }
+            catch (RuntimeException failure) {
+                throw storageDenial(failure);
+            }
+        }
+    }
+
+    private static final class RedactingPageSource
+            implements ConnectorPageSource
+    {
+        private final ConnectorPageSource delegate;
+
+        private RedactingPageSource(ConnectorPageSource delegate)
+        {
+            this.delegate = requireNonNull(delegate, "delegate is null");
+        }
+
+        @Override
+        public long getCompletedBytes()
+        {
+            return delegate.getCompletedBytes();
+        }
+
+        @Override
+        public OptionalLong getCompletedPositions()
+        {
+            return delegate.getCompletedPositions();
+        }
+
+        @Override
+        public long getReadTimeNanos()
+        {
+            return delegate.getReadTimeNanos();
+        }
+
+        @Override
+        public boolean isFinished()
+        {
+            return delegate.isFinished();
+        }
+
+        @Override
+        public SourcePage getNextSourcePage()
+        {
+            try {
+                return delegate.getNextSourcePage();
+            }
+            catch (RuntimeException failure) {
+                throw storageDenial(failure);
+            }
+        }
+
+        @Override
+        public void close()
+                throws IOException
+        {
+            delegate.close();
+        }
+
+        @Override
+        public CompletableFuture<?> isBlocked()
+        {
+            return delegate.isBlocked();
+        }
+
+        @Override
+        public Metrics getMetrics()
+        {
+            return delegate.getMetrics();
+        }
+    }
+
+    /**
+     * File system factory that injects only verified JWT AWS session credentials.
+     * Each returned file system enforces primary-catalog storage grants on every file open.
+     */
+    private static final class DedicatedSessionFileSystemFactory
+            implements TrinoFileSystemFactory
+    {
+        private final HoglakeReadSessionVerifier verifier;
+        private final TrinoFileSystemFactory delegate;
+
+        private DedicatedSessionFileSystemFactory(HoglakeReadSessionVerifier verifier, TrinoFileSystemFactory delegate)
+        {
+            this.verifier = requireNonNull(verifier, "verifier is null");
+            this.delegate = requireNonNull(delegate, "delegate is null");
+        }
+
+        @Override
+        public TrinoFileSystem create(ConnectorIdentity identity)
+        {
+            HoglakeReadSessionContext context = verifier.verify(identity);
+            StorageSession storage = context.storage();
+            TrinoFileSystem fileSystem = delegate.create(ConnectorIdentity.forUser("hoglake-dedicated-read")
+                    .withExtraCredentials(ImmutableMap.of(
+                            EXTRA_CREDENTIALS_ACCESS_KEY_PROPERTY, storage.accessKeyId(),
+                            EXTRA_CREDENTIALS_SECRET_KEY_PROPERTY, storage.secretAccessKey(),
+                            EXTRA_CREDENTIALS_SESSION_TOKEN_PROPERTY, storage.sessionToken()))
+                    .build());
+            return new AuthorizingFileSystem(fileSystem, context);
+        }
+    }
+
+    /**
+     * Read-only file system wrapper that enforces primary-catalog signed grants on every open.
+     */
+    private static final class AuthorizingFileSystem
+            implements TrinoFileSystem
+    {
+        private final TrinoFileSystem delegate;
+        private final HoglakeReadSessionContext context;
+
+        private AuthorizingFileSystem(TrinoFileSystem delegate, HoglakeReadSessionContext context)
+        {
+            this.delegate = requireNonNull(delegate, "delegate is null");
+            this.context = requireNonNull(context, "context is null");
+        }
+
+        private void authorize(Location location)
+        {
+            if (location == null) {
+                throw targetDenied();
+            }
+            context.requireStorageLocation(context.catalog(), location.toString(), context.storage().region());
+        }
+
+        @Override
+        public TrinoInputFile newInputFile(Location location)
+        {
+            authorize(location);
+            return delegate.newInputFile(location);
+        }
+
+        @Override
+        public TrinoInputFile newInputFile(Location location, long length)
+        {
+            authorize(location);
+            return delegate.newInputFile(location, length);
+        }
+
+        @Override
+        public TrinoInputFile newInputFile(Location location, long length, Instant lastModified)
+        {
+            authorize(location);
+            return delegate.newInputFile(location, length, lastModified);
+        }
+
+        @Override
+        public TrinoOutputFile newOutputFile(Location location)
+        {
+            throw targetDenied();
+        }
+
+        @Override
+        public void deleteFile(Location location)
+        {
+            throw targetDenied();
+        }
+
+        @Override
+        public void deleteDirectory(Location location)
+        {
+            throw targetDenied();
+        }
+
+        @Override
+        public void renameFile(Location source, Location target)
+        {
+            throw targetDenied();
+        }
+
+        @Override
+        public FileIterator listFiles(Location location)
+        {
+            throw targetDenied();
+        }
+
+        @Override
+        public Optional<Boolean> directoryExists(Location location)
+        {
+            throw targetDenied();
+        }
+
+        @Override
+        public void createDirectory(Location location)
+        {
+            throw targetDenied();
+        }
+
+        @Override
+        public void renameDirectory(Location source, Location target)
+        {
+            throw targetDenied();
+        }
+
+        @Override
+        public Set<Location> listDirectories(Location location)
+        {
+            throw targetDenied();
+        }
+
+        @Override
+        public Optional<Location> createTemporaryDirectory(Location targetPath, String temporaryPrefix, String relativePrefix)
+        {
+            throw targetDenied();
+        }
+
+        @Override
+        public Metrics getMetrics()
+        {
+            return delegate.getMetrics();
+        }
+    }
+}
