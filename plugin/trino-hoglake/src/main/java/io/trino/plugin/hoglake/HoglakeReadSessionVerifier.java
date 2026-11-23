@@ -187,7 +187,7 @@ final class HoglakeReadSessionVerifier
             this.maxLifetimeSeconds = maxLifetimeSeconds;
             this.clock = clock;
             this.ticker = ticker;
-            this.keys = readKeys();
+            this.keys = readKeys(true);
             this.lastReload = ticker.getAsLong();
         }
         catch (Exception _) {
@@ -545,14 +545,15 @@ final class HoglakeReadSessionVerifier
         }
         lastReload = now;
         try {
-            keys = readKeys();
+            // Apply a well-formed empty key set so withdrawal of the last signing key takes effect.
+            keys = readKeys(false);
         }
         catch (Exception _) {
             // Keep the previous public keys when a mounted file reload fails.
         }
     }
 
-    private Map<String, PublicKey> readKeys()
+    private Map<String, PublicKey> readKeys(boolean requireSigningKey)
             throws IOException, GeneralSecurityException
     {
         require(Files.isRegularFile(jwksFile));
@@ -591,7 +592,9 @@ final class HoglakeReadSessionVerifier
             require(++count <= MAX_SIGNING_KEYS);
             result.put(text(entry, "kid"), publicKey(entry));
         }
-        require(count > 0);
+        if (requireSigningKey) {
+            require(count > 0);
+        }
         return result.buildOrThrow();
     }
 

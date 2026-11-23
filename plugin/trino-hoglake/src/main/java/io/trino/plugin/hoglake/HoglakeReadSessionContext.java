@@ -148,7 +148,7 @@ final class HoglakeReadSessionContext
             return false;
         }
         for (StorageGrant grant : grants) {
-            if (grant.matches(bucket, region, objectKey)) {
+            if (grant.matchesValidated(bucket, region, objectKey)) {
                 return true;
             }
         }
@@ -167,7 +167,7 @@ final class HoglakeReadSessionContext
             return false;
         }
         for (StorageGrant grant : grants) {
-            if (grant.target().equals(target) && grant.matches(bucket, region, objectKey)) {
+            if (grant.target().equals(target) && grant.matchesValidated(bucket, region, objectKey)) {
                 return true;
             }
         }
@@ -352,11 +352,8 @@ final class HoglakeReadSessionContext
             requireNonNull(path, "path is null");
         }
 
-        public boolean matches(String requestedBucket, String requestedRegion, String objectKey)
+        private boolean matchesValidated(String requestedBucket, String requestedRegion, String objectKey)
         {
-            if (!isValidStorageTarget(requestedBucket, requestedRegion, objectKey)) {
-                return false;
-            }
             if (!bucket.equals(requestedBucket) || !region.equals(requestedRegion)) {
                 return false;
             }

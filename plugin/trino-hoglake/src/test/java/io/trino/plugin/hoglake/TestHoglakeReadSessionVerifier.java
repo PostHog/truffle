@@ -698,6 +698,19 @@ final class TestHoglakeReadSessionVerifier
         Files.writeString(jwksFile, "not-valid-json", UTF_8);
         ticker.set(SECONDS.toNanos(60));
         assertThat(verifier.verify(session(USER, PRINCIPAL, rotatedJwt)).token()).isEqualTo(rotatedJwt);
+
+        // A well-formed empty JWKS withdraws the last signing key on reload.
+        Files.writeString(jwksFile, "{\"keys\":[]}", UTF_8);
+        ticker.set(SECONDS.toNanos(90));
+        assertAuthorityDenied(() -> verifier.verify(session(USER, PRINCIPAL, rotatedJwt)), rotatedJwt);
+
+        // A subsequent reload restores verification once a new key is published.
+        KeyPair restored = keyPair();
+        String restoredJwt = token(restored, "restored-key", validClaims());
+        writeJwks(jwksFile, restored, "restored-key");
+        ticker.set(SECONDS.toNanos(120));
+        assertThat(verifier.verify(session(USER, PRINCIPAL, restoredJwt)).token()).isEqualTo(restoredJwt);
+        assertAuthorityDenied(() -> verifier.verify(session(USER, PRINCIPAL, rotatedJwt)), rotatedJwt);
     }
 
     @Test
@@ -715,6 +728,11 @@ final class TestHoglakeReadSessionVerifier
         assertBadConfig(() -> new HoglakeReadSessionVerifier(ISSUER, jwksFile, DEFAULT_PROFILE, REMOTE_TARGETS, ImmutableSet.of(BACKEND_UUID), Optional.of("INVALID_REGION")));
         assertBadConfig(() -> new HoglakeReadSessionVerifier(ISSUER, jwksFile, DEFAULT_PROFILE, REMOTE_TARGETS, ImmutableSet.of(BACKEND_UUID), Optional.of(REGION), 601, 900, Clock.systemUTC(), System::nanoTime));
         assertBadConfig(() -> new HoglakeReadSessionVerifier(ISSUER, jwksFile, DEFAULT_PROFILE, REMOTE_TARGETS, ImmutableSet.of(BACKEND_UUID), Optional.of(REGION), 60, 901, Clock.systemUTC(), System::nanoTime));
+
+        // The verifier rejects an empty JWKS at startup.
+        Path emptyJwks = directory.resolve("empty-jwks.json");
+        Files.writeString(emptyJwks, "{\"keys\":[]}", UTF_8);
+        assertBadConfig(() -> new HoglakeReadSessionVerifier(ISSUER, emptyJwks, DEFAULT_PROFILE, REMOTE_TARGETS, ImmutableSet.of(BACKEND_UUID), Optional.of(REGION)));
 
         // The verifier rejects private key fields in mounted JWKS.
         Map<String, Object> withPrivateField = new LinkedHashMap<>(jwk(key, KID));

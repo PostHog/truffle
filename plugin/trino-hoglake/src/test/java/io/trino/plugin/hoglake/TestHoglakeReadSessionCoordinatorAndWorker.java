@@ -83,7 +83,7 @@ final class TestHoglakeReadSessionCoordinatorAndWorker
     Path directory;
 
     @Test
-    void testCoordinatorAndWorkerVerifyIndependentlyOverTaskTransport()
+    void testCoordinatorAndWorkerVerifyReconstructedSession()
     {
         KeyPair key = keyPair();
         Path coordinatorJwks = directory.resolve("coordinator-jwks.json");
@@ -108,6 +108,7 @@ final class TestHoglakeReadSessionCoordinatorAndWorker
         assertThat(coordinatorContext.teamId()).isEqualTo(4L);
 
         // Reconstruct the worker session from the session representation and protected credentials.
+        // Protected credential task dispatch is covered by TestHttpRemoteTask.testProtectedCredentialDispatch.
         SessionPropertyManager properties = new SessionPropertyManager();
         Session workerSession = coordinatorSession.toSessionRepresentation()
                 .toSession(properties, coordinatorSession.getIdentity().getExtraCredentials(), Optional.empty());
