@@ -364,6 +364,16 @@ public class HoglakeClient
     }
 
     /**
+     * Fetch visible data files and deletion vectors for one pinned snapshot and table UUID.
+     */
+    public List<HoglakeDtos.ScanFile> scanPinned(String namespace, String table, long snapshot, String tableUuid)
+    {
+        checkArgument(snapshot >= 0, "snapshot must be non-negative: %s", snapshot);
+        checkArgument(tableUuid != null && !tableUuid.isBlank(), "tableUuid must be non-blank");
+        return fetchScan(namespace, table, "/scan?snapshot=" + snapshot + "&table_uuid=" + encode(tableUuid));
+    }
+
+    /**
      * The split source for a read: {@link #scan(String, String, long)} plus
      * each file's row-group start offsets ({@code include=split_offsets}),
      * which split planning cuts on when present. A non-empty

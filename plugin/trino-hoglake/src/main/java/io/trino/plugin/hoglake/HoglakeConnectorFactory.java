@@ -14,6 +14,7 @@
 package io.trino.plugin.hoglake;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.inject.Binder;
 import com.google.inject.Injector;
 import com.google.inject.Key;
@@ -39,16 +40,24 @@ import io.trino.spi.connector.ConnectorPageSourceProvider;
 import io.trino.spi.connector.ConnectorSplitManager;
 import org.weakref.jmx.guice.MBeanModule;
 
+import java.time.Clock;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 
 import static io.airlift.configuration.ConfigBinder.configBinder;
 import static io.trino.plugin.base.Versions.checkStrictSpiVersionMatch;
+import static java.util.concurrent.TimeUnit.SECONDS;
 
 public class HoglakeConnectorFactory
         implements ConnectorFactory
 {
+    private static final String MULTI_TENANT_PROPERTY = "hoglake.multi-tenant";
+    private static final String SHARED_REMOTE_READ_PROPERTY = "hoglake.shared.remote-read";
+    private static final String DEDICATED_LOCAL_READ_PROPERTY = "hoglake.dedicated.local-read";
+    private static final Set<String> SESSION_ONLY_S3_PROPERTIES = ImmutableSet.of("s3.region", "s3.endpoint", "s3.path-style-access");
+
     @Override
     public String getName()
     {
@@ -61,9 +70,30 @@ public class HoglakeConnectorFactory
         checkStrictSpiVersionMatch(context, this);
         ClassLoader classLoader = getClass().getClassLoader();
         try (ThreadContextClassLoader _ = new ThreadContextClassLoader(classLoader)) {
-            if (sharedMode(config)) {
-                if (remoteRead(config)) {
-                    Map<String, String> properties = remoteReadProperties(config);
+            boolean shared = booleanProperty(config, MULTI_TENANT_PROPERTY);
+            boolean dedicated = booleanProperty(config, DEDICATED_LOCAL_READ_PROPERTY);
+            if (shared && dedicated) {
+                throw new IllegalArgumentException("hoglake.multi-tenant and hoglake.dedicated.local-read cannot both be enabled");
+            }
+            if (dedicated) {
+                Map<String, String> properties = sessionOnlyS3Properties(config, DEDICATED_LOCAL_READ_PROPERTY);
+                Injector injector = new Bootstrap(
+                        "io.trino.bootstrap.catalog." + catalogName,
+                        new MBeanModule(),
+                        new MBeanServerModule(),
+                        new DedicatedModule(properties.get("s3.region")),
+                        new FileSystemModule(catalogName, context, false),
+                        new ConnectorContextModule(catalogName, context))
+                        .doNotInitializeLogging()
+                        .disableSystemProperties()
+                        .setRequiredConfigurationProperties(properties)
+                        .initialize();
+                return injector.getInstance(HoglakeDedicatedConnector.class);
+            }
+            Map<String, String> effectiveConfig = withoutProperty(config, DEDICATED_LOCAL_READ_PROPERTY);
+            if (shared) {
+                if (booleanProperty(effectiveConfig, SHARED_REMOTE_READ_PROPERTY)) {
+                    Map<String, String> properties = sessionOnlyS3Properties(effectiveConfig, SHARED_REMOTE_READ_PROPERTY);
                     Injector injector = new Bootstrap(
                             "io.trino.bootstrap.catalog." + catalogName,
                             new MBeanModule(),
@@ -83,7 +113,7 @@ public class HoglakeConnectorFactory
                         new ConnectorContextModule(catalogName, context))
                         .doNotInitializeLogging()
                         .disableSystemProperties()
-                        .setRequiredConfigurationProperties(config)
+                        .setRequiredConfigurationProperties(effectiveConfig)
                         .initialize();
                 return injector.getInstance(HoglakeSharedConnector.class);
             }
@@ -96,8 +126,8 @@ public class HoglakeConnectorFactory
                     new ConnectorContextModule(catalogName, context))
                     .doNotInitializeLogging()
                     .disableSystemProperties()
-                    .setOptionalConfigurationProperties(HoglakeFileSystemConfig.defaults(config))
-                    .setRequiredConfigurationProperties(HoglakeFileSystemConfig.normalize(config))
+                    .setOptionalConfigurationProperties(HoglakeFileSystemConfig.defaults(effectiveConfig))
+                    .setRequiredConfigurationProperties(HoglakeFileSystemConfig.normalize(effectiveConfig))
                     .initialize();
 
             return new HoglakeConnector(
@@ -110,28 +140,30 @@ public class HoglakeConnectorFactory
         }
     }
 
-    private static boolean sharedMode(Map<String, String> config)
+    private static boolean booleanProperty(Map<String, String> config, String property)
     {
-        String value = config.get("hoglake.multi-tenant");
+        String value = config.get(property);
         if (value == null || value.equals("false")) {
             return false;
         }
         if (value.equals("true")) {
             return true;
         }
-        throw new IllegalArgumentException("hoglake.multi-tenant must be exactly true or false");
+        throw new IllegalArgumentException("%s must be exactly true or false".formatted(property));
     }
 
-    private static boolean remoteRead(Map<String, String> config)
+    private static Map<String, String> withoutProperty(Map<String, String> config, String property)
     {
-        String value = config.get("hoglake.shared.remote-read");
-        if (value == null || value.equals("false")) {
-            return false;
+        if (!config.containsKey(property)) {
+            return config;
         }
-        if (value.equals("true")) {
-            return true;
+        ImmutableMap.Builder<String, String> filtered = ImmutableMap.builder();
+        for (Map.Entry<String, String> entry : config.entrySet()) {
+            if (!entry.getKey().equals(property)) {
+                filtered.put(entry);
+            }
         }
-        throw new IllegalArgumentException("hoglake.shared.remote-read must be exactly true or false");
+        return filtered.buildOrThrow();
     }
 
     /**
@@ -141,26 +173,24 @@ public class HoglakeConnectorFactory
      * security mapping, a cache or another file system would each be a second
      * source of authority or a store shared between callers.
      */
-    private static Map<String, String> remoteReadProperties(Map<String, String> config)
+    private static Map<String, String> sessionOnlyS3Properties(Map<String, String> config, String modeProperty)
     {
         for (String name : config.keySet()) {
             boolean storage = name.startsWith("s3.") || name.startsWith("fs.") || name.startsWith("hoglake.s3.") ||
                     name.startsWith("gcs.") || name.startsWith("azure.") || name.startsWith("hive.") || name.startsWith("local.");
-            if (storage && !REMOTE_READ_STORAGE_PROPERTIES.contains(name)) {
-                throw new IllegalArgumentException("Configuration property '%s' cannot be set with hoglake.shared.remote-read".formatted(name));
+            if (storage && !SESSION_ONLY_S3_PROPERTIES.contains(name)) {
+                throw new IllegalArgumentException("Configuration property '%s' cannot be set with %s".formatted(name, modeProperty));
             }
         }
         String region = config.get("s3.region");
         if (region == null || region.isBlank()) {
-            throw new IllegalArgumentException("s3.region is required with hoglake.shared.remote-read");
+            throw new IllegalArgumentException("s3.region is required with %s".formatted(modeProperty));
         }
         return ImmutableMap.<String, String>builder()
                 .putAll(config)
                 .put("fs.s3.enabled", "true")
                 .buildOrThrow();
     }
-
-    private static final Set<String> REMOTE_READ_STORAGE_PROPERTIES = Set.of("s3.region", "s3.endpoint", "s3.path-style-access");
 
     private static class SharedModule
             implements Module
@@ -207,6 +237,66 @@ public class HoglakeConnectorFactory
                 readPath = Optional.of(new HoglakeSharedReadPath(config, verifier, injector.getInstance(TrinoFileSystemFactory.class)));
             }
             return new HoglakeSharedConnector(client, verifier, lifeCycleManager, readPath);
+        }
+    }
+
+    private static class DedicatedModule
+            implements Module
+    {
+        private final String storageRegion;
+
+        private DedicatedModule(String storageRegion)
+        {
+            this.storageRegion = storageRegion;
+        }
+
+        @Override
+        public void configure(Binder binder)
+        {
+            configBinder(binder).bindConfig(HoglakeDedicatedConfig.class);
+        }
+
+        @Provides
+        @Singleton
+        public HoglakeReadSessionVerifier verifier(HoglakeDedicatedConfig config)
+        {
+            ImmutableSet.Builder<UUID> backends = ImmutableSet.builder();
+            for (String backend : config.getHogliteBackends()) {
+                UUID parsed;
+                try {
+                    parsed = UUID.fromString(backend);
+                }
+                catch (IllegalArgumentException _) {
+                    throw new IllegalArgumentException("Invalid dedicated Hoglake read session configuration");
+                }
+                if (!parsed.toString().equals(backend)) {
+                    throw new IllegalArgumentException("Invalid dedicated Hoglake read session configuration");
+                }
+                backends.add(parsed);
+            }
+            return new HoglakeReadSessionVerifier(
+                    config.getIssuer(),
+                    config.getJwksFile().toPath(),
+                    config.getProfile(),
+                    config.getRemoteTargets(),
+                    backends.build(),
+                    Optional.of(storageRegion),
+                    config.getClockSkew().roundTo(SECONDS),
+                    config.getMaxLifetime().roundTo(SECONDS),
+                    Clock.systemUTC(),
+                    System::nanoTime);
+        }
+
+        @Provides
+        @Singleton
+        public HoglakeDedicatedConnector connector(
+                HoglakeDedicatedConfig config,
+                HoglakeReadSessionVerifier verifier,
+                TrinoFileSystemFactory fileSystemFactory,
+                LifeCycleManager lifeCycleManager)
+        {
+            HoglakeDedicatedReadPath readPath = new HoglakeDedicatedReadPath(config, verifier, fileSystemFactory);
+            return new HoglakeDedicatedConnector(readPath, verifier, lifeCycleManager);
         }
     }
 }
