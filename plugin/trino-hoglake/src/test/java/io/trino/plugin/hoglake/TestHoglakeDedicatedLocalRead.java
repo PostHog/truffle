@@ -450,7 +450,8 @@ final class TestHoglakeDedicatedLocalRead
 
         CallerFixture alice = caller(key, "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSA", "SECRETA", "TOKENA");
         String namespace = "/v1/catalogs/catalog-a/namespaces/team_4";
-        for (String failing : List.of(namespace, namespace + "/tables", namespace + "/tables/events")) {
+        String scan = namespace + "/tables/events/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID;
+        for (String failing : List.of(namespace, namespace + "/tables", namespace + "/tables/events", scan)) {
             List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
             try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> request.rawPathAndQuery().equals(failing)
                     ? new Response(500, "{\"error\":\"sensitive-response-body\"}")

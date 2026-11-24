@@ -669,6 +669,28 @@ final class HoglakeDedicatedReadPath
         return new TrinoException(PERMISSION_DENIED, TARGET_DENIED);
     }
 
+    /**
+     * A metadata request of a remote read session, the scan included. A failure keeps its error code and
+     * loses its message and cause: the client's message can hold the request URI and
+     * the response body.
+     */
+    private <T> T discover(Supplier<T> request)
+    {
+        if (!scope.remote()) {
+            return request.get();
+        }
+        try {
+            return request.get();
+        }
+        catch (TrinoException e) {
+            if (PERMISSION_DENIED.toErrorCode().equals(e.getErrorCode())) {
+                throw requestDenied();
+            }
+            ErrorCode code = e.getErrorCode();
+            throw new TrinoException(() -> code, DISCOVERY_FAILED);
+        }
+    }
+
     private static TrinoException requestDenied()
     {
         return new TrinoException(PERMISSION_DENIED, REQUEST_DENIED);
@@ -725,8 +747,8 @@ final class HoglakeDedicatedReadPath
                 return new FixedSplitSource(ImmutableList.of());
             }
 
-            List<HoglakeDtos.ScanFile> scanFiles = reader.clientFor(session)
-                    .scanPinned(handle.schemaName(), handle.tableName(), handle.snapshotId(), handle.tableUuid());
+            List<HoglakeDtos.ScanFile> scanFiles = discover(() -> reader.clientFor(session)
+                    .scanPinned(handle.schemaName(), handle.tableName(), handle.snapshotId(), handle.tableUuid()));
 
             HoglakeReadSessionContext context = reader.context();
 
@@ -787,28 +809,6 @@ final class HoglakeDedicatedReadPath
             return discover(() -> reader.clientFor(session).findNamespace(schemaName))
                     .filter(namespace -> schemaName.equals(namespace.name()) && namespace.isRemote() == scope.remote())
                     .isPresent();
-        }
-
-        /**
-         * A discovery request of a remote read session. A failure keeps its error code and
-         * loses its message and cause: the client's message can hold the request URI and
-         * the response body.
-         */
-        private <T> T discover(Supplier<T> request)
-        {
-            if (!scope.remote()) {
-                return request.get();
-            }
-            try {
-                return request.get();
-            }
-            catch (TrinoException e) {
-                if (PERMISSION_DENIED.toErrorCode().equals(e.getErrorCode())) {
-                    throw requestDenied();
-                }
-                ErrorCode code = e.getErrorCode();
-                throw new TrinoException(() -> code, DISCOVERY_FAILED);
-            }
         }
 
         @Override
