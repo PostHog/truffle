@@ -14,6 +14,7 @@
 package io.trino.plugin.hoglake;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import io.airlift.configuration.ConfigurationFactory;
 import io.airlift.units.Duration;
 import org.junit.jupiter.api.Test;
@@ -44,7 +45,9 @@ class TestHoglakeSharedConfig
                 .setIssuer(null)
                 .setBackendBindings(null)
                 .setClockSkew(new Duration(60, SECONDS))
-                .setScopedMaxLifetime(new Duration(900, SECONDS)));
+                .setScopedMaxLifetime(new Duration(900, SECONDS))
+                .setReadSessionProfile(null)
+                .setReadSessionRemoteTargets(ImmutableSet.of()));
     }
 
     @Test
@@ -61,6 +64,8 @@ class TestHoglakeSharedConfig
                         .put("hoglake.shared.backend-bindings", "{\"11111111-2222-4333-8444-555555555555\":\"postgres\"}")
                         .put("hoglake.shared.clock-skew", "30s")
                         .put("hoglake.shared.scoped-max-lifetime", "600s")
+                        .put("hoglake.shared.read-session-profile", "example.aws-session")
+                        .put("hoglake.shared.read-session-remote-targets", "remote:events,remote:imports")
                         .buildOrThrow(),
                 new HoglakeSharedConfig()
                         .setUri(URI.create("https://metadata.example.test"))
@@ -72,7 +77,9 @@ class TestHoglakeSharedConfig
                         .setIssuer("https://issuer.example.test")
                         .setBackendBindings("{\"11111111-2222-4333-8444-555555555555\":\"postgres\"}")
                         .setClockSkew(new Duration(30, SECONDS))
-                        .setScopedMaxLifetime(new Duration(600, SECONDS)));
+                        .setScopedMaxLifetime(new Duration(600, SECONDS))
+                        .setReadSessionProfile("example.aws-session")
+                        .setReadSessionRemoteTargets(ImmutableSet.of("remote:events", "remote:imports")));
     }
 
     @Test

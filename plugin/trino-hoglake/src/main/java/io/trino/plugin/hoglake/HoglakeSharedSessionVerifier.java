@@ -139,6 +139,20 @@ final class HoglakeSharedSessionVerifier
         }
     }
 
+    /**
+     * The configured Hoglite backends: the only placements a read session may name.
+     */
+    Set<UUID> hogliteBackends()
+    {
+        ImmutableSet.Builder<UUID> hoglite = ImmutableSet.builder();
+        backends.forEach((id, kind) -> {
+            if ("hoglite".equals(kind)) {
+                hoglite.add(id);
+            }
+        });
+        return hoglite.build();
+    }
+
     public HoglakeSharedSessionContext verify(ConnectorSession session)
     {
         return verify(session.getIdentity());

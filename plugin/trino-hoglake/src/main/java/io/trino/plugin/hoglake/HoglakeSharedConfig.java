@@ -13,6 +13,7 @@
  */
 package io.trino.plugin.hoglake;
 
+import com.google.common.collect.ImmutableSet;
 import io.airlift.configuration.Config;
 import io.airlift.configuration.ConfigDescription;
 import io.airlift.units.Duration;
@@ -22,6 +23,8 @@ import jakarta.validation.constraints.NotNull;
 
 import java.io.File;
 import java.net.URI;
+import java.util.Optional;
+import java.util.Set;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 
@@ -43,6 +46,8 @@ public class HoglakeSharedConfig
     private String backendBindings;
     private Duration clockSkew = new Duration(60, SECONDS);
     private Duration scopedMaxLifetime = new Duration(900, SECONDS);
+    private Optional<String> readSessionProfile = Optional.empty();
+    private Set<String> readSessionRemoteTargets = ImmutableSet.of();
 
     @NotNull
     public URI getUri()
@@ -187,6 +192,34 @@ public class HoglakeSharedConfig
     public HoglakeSharedConfig setScopedMaxLifetime(Duration scopedMaxLifetime)
     {
         this.scopedMaxLifetime = scopedMaxLifetime;
+        return this;
+    }
+
+    @NotNull
+    public Optional<String> getReadSessionProfile()
+    {
+        return readSessionProfile;
+    }
+
+    @Config("hoglake.shared.read-session-profile")
+    @ConfigDescription("Token profile of dedicated read sessions that may read their own remote team schema; requires remote read")
+    public HoglakeSharedConfig setReadSessionProfile(String readSessionProfile)
+    {
+        this.readSessionProfile = Optional.ofNullable(readSessionProfile);
+        return this;
+    }
+
+    @NotNull
+    public Set<String> getReadSessionRemoteTargets()
+    {
+        return readSessionRemoteTargets;
+    }
+
+    @Config("hoglake.shared.read-session-remote-targets")
+    @ConfigDescription("The two remote storage grant target names of dedicated read sessions")
+    public HoglakeSharedConfig setReadSessionRemoteTargets(Set<String> readSessionRemoteTargets)
+    {
+        this.readSessionRemoteTargets = readSessionRemoteTargets == null ? ImmutableSet.of() : ImmutableSet.copyOf(readSessionRemoteTargets);
         return this;
     }
 }

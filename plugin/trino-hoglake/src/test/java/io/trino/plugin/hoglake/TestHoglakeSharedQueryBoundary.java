@@ -383,8 +383,8 @@ class TestHoglakeSharedQueryBoundary
         assertThat(connector.getTableFunctions()).isEmpty();
         assertThat(HoglakeSharedConnector.class.getDeclaredConstructors()).singleElement().satisfies(constructor ->
                 assertThat(constructor.getParameterTypes()).containsExactly(
-                        HoglakeSharedHttpClient.class, HoglakeSharedSessionVerifier.class, LifeCycleManager.class, Optional.class));
-        // Discovery only: the one optional part, the read path, is absent
+                        HoglakeSharedHttpClient.class, HoglakeSharedSessionVerifier.class, LifeCycleManager.class, Optional.class, Optional.class));
+        // Discovery only: both optional parts, the read path and the read session path, are absent
         assertThat(((HoglakeSharedConnector) connector).readsRemoteTeamSchemas()).isFalse();
         assertThat(Arrays.stream(HoglakeSharedConnector.class.getDeclaredFields()).map(Field::getType).collect(toImmutableSet()))
                 .containsExactlyInAnyOrder(
@@ -394,7 +394,7 @@ class TestHoglakeSharedQueryBoundary
                         ConnectorSplitManager.class,
                         ConnectorPageSourceProvider.class,
                         ConnectorPageSinkProvider.class,
-                        // The read path, absent here, and its session properties, empty here
+                        // The read path and the read session path, absent here, and the session properties, empty here
                         Optional.class,
                         List.class);
     }

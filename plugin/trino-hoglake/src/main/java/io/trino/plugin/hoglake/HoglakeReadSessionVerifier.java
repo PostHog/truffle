@@ -196,6 +196,44 @@ final class HoglakeReadSessionVerifier
         }
     }
 
+    /**
+     * True when the session token names any dedicated read session audience. The token is
+     * not verified here: the answer only selects which verifier judges it, and a token
+     * that mixes these audiences with others is refused by both.
+     */
+    static boolean namesDedicatedAudience(ConnectorIdentity identity)
+    {
+        try {
+            String token = identity == null ? null : identity.getExtraCredentials().get(SESSION_TOKEN);
+            if (token == null || token.isEmpty() || token.length() > MAX_TOKEN_BYTES) {
+                return false;
+            }
+            String[] segments = token.split("\\.", -1);
+            if (segments.length != 3) {
+                return false;
+            }
+            JsonNode audience = object(decode(segments[1], MAX_TOKEN_BYTES)).get("aud");
+            if (audience == null) {
+                return false;
+            }
+            if (audience.isTextual()) {
+                return AUDIENCES.contains(audience.textValue());
+            }
+            if (!audience.isArray()) {
+                return false;
+            }
+            for (JsonNode value : audience) {
+                if (value.isTextual() && AUDIENCES.contains(value.textValue())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        catch (IOException | RuntimeException _) {
+            return false;
+        }
+    }
+
     public HoglakeReadSessionContext verify(ConnectorSession session)
     {
         if (session == null) {

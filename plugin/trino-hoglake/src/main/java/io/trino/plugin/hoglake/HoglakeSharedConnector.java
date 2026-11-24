@@ -116,10 +116,21 @@ public final class HoglakeSharedConnector
     private final ConnectorPageSourceProvider pageSourceProvider;
     private final ConnectorPageSinkProvider pageSinkProvider;
     private final Optional<HoglakeSharedReadPath> readPath;
+    // The second token profile: a dedicated read session, on the relayed routes of its own team schema only
+    private final Optional<HoglakeDedicatedReadPath> readSessions;
     private final List<PropertyMetadata<?>> sessionProperties;
 
-    public HoglakeSharedConnector(HoglakeSharedHttpClient client, HoglakeSharedSessionVerifier verifier, LifeCycleManager lifeCycleManager, Optional<HoglakeSharedReadPath> readPath)
+    public HoglakeSharedConnector(
+            HoglakeSharedHttpClient client,
+            HoglakeSharedSessionVerifier verifier,
+            LifeCycleManager lifeCycleManager,
+            Optional<HoglakeSharedReadPath> readPath,
+            Optional<HoglakeDedicatedReadPath> readSessions)
     {
+        this.readSessions = requireNonNull(readSessions, "readSessions is null");
+        if (readSessions.isPresent() && readPath.isEmpty()) {
+            throw new IllegalArgumentException("Shared Hoglake read sessions require the remote read path");
+        }
         this.client = requireNonNull(client, "client is null");
         this.verifier = requireNonNull(verifier, "verifier is null");
         this.lifeCycleManager = requireNonNull(lifeCycleManager, "lifeCycleManager is null");
@@ -141,20 +152,36 @@ public final class HoglakeSharedConnector
     @Override
     public ConnectorMetadata getMetadata(ConnectorSession session, ConnectorTransactionHandle transactionHandle)
     {
+        if (isReadSession(session)) {
+            // The read session path verifies the token, and is the only code that sees it
+            return readSessions.orElseThrow().metadata(session, transactionHandle);
+        }
         verifier.verify(session);
         return new SharedMetadata(transactionHandle);
+    }
+
+    /**
+     * True when a read session path is configured and the token names a dedicated read
+     * session audience. The token is not verified here; the path this selects verifies it.
+     * Every other token, and every token without that path, goes to the shared verifier.
+     */
+    private boolean isReadSession(ConnectorSession session)
+    {
+        return readSessions.isPresent() && session != null && HoglakeReadSessionVerifier.namesDedicatedAudience(session.getIdentity());
     }
 
     @Override
     public void commit(ConnectorTransactionHandle handle)
     {
         readPath.ifPresent(path -> path.end(handle));
+        readSessions.ifPresent(path -> path.end(handle));
     }
 
     @Override
     public void rollback(ConnectorTransactionHandle handle)
     {
         readPath.ifPresent(path -> path.end(handle));
+        readSessions.ifPresent(path -> path.end(handle));
     }
 
     @Override
@@ -192,7 +219,12 @@ public final class HoglakeSharedConnector
                 readPath.ifPresent(HoglakeSharedReadPath::close);
             }
             finally {
-                lifeCycleManager.stop();
+                try {
+                    readSessions.ifPresent(HoglakeDedicatedReadPath::close);
+                }
+                finally {
+                    lifeCycleManager.stop();
+                }
             }
         }
     }
@@ -234,6 +266,9 @@ public final class HoglakeSharedConnector
                 Set<ColumnHandle> dynamicFilterColumns,
                 Constraint constraint)
         {
+            if (isReadSession(session)) {
+                return readSessions.orElseThrow().splitManager().getSplits(transaction, session, table, dynamicFilterColumns, constraint);
+            }
             reads(session, table);
             return readPath.orElseThrow().splitManager(session, transaction).getSplits(transaction, session, table, dynamicFilterColumns, constraint);
         }
@@ -258,6 +293,9 @@ public final class HoglakeSharedConnector
                 List<ColumnHandle> columns,
                 DynamicFilter dynamicFilter)
         {
+            if (isReadSession(session)) {
+                return readSessions.orElseThrow().pageSourceProvider().createPageSource(transaction, session, split, table, tableCredentials, columns, dynamicFilter);
+            }
             reads(session, table);
             return readPath.orElseThrow().pageSources().createPageSource(transaction, session, split, table, tableCredentials, columns, dynamicFilter);
         }
@@ -273,6 +311,9 @@ public final class HoglakeSharedConnector
                 DynamicFilter dynamicFilter,
                 MemoryContext memoryContext)
         {
+            if (isReadSession(session)) {
+                return readSessions.orElseThrow().pageSourceProvider().createPageSource(transaction, session, split, table, tableCredentials, columns, dynamicFilter, memoryContext);
+            }
             reads(session, table);
             try {
                 return readPath.orElseThrow().pageSources().createPageSource(transaction, session, split, table, tableCredentials, columns, dynamicFilter, memoryContext);

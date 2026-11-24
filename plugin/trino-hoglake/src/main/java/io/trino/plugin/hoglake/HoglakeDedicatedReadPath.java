@@ -15,6 +15,7 @@ package io.trino.plugin.hoglake;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import io.airlift.slice.Slice;
 import io.trino.filesystem.FileIterator;
 import io.trino.filesystem.Location;
@@ -135,12 +136,15 @@ final class HoglakeDedicatedReadPath
     private static final String REQUEST_DENIED = "Dedicated Hoglake read session does not allow this request";
     private static final String LOCAL_TABLE_DENIED = "Dedicated Hoglake local read requires a valid pinned local table";
 
+    private static final String REMOTE_TABLE_DENIED = "Hoglake read session requires a valid pinned table of its own team schema";
     private static final Pattern NAMESPACE_ROUTE = Pattern.compile("/namespaces/([^/]+)");
+    private static final Pattern TABLES_ROUTE = Pattern.compile("/namespaces/([^/]+)/tables");
     private static final Pattern TABLE_ROUTE = Pattern.compile("/namespaces/([^/]+)/tables/([^/]+)");
     private static final Pattern SCAN_ROUTE = Pattern.compile("/namespaces/([^/]+)/tables/([^/]+)/scan");
     private static final Pattern NON_NEGATIVE_INTEGER = Pattern.compile("0|[1-9][0-9]*");
 
     private final HoglakeReadSessionVerifier verifier;
+    private final Scope scope;
     private final String baseUri;
     private final String basePath;
     private final Duration requestTimeout;
@@ -160,6 +164,34 @@ final class HoglakeDedicatedReadPath
 
     HoglakeDedicatedReadPath(URI baseUri, Duration requestTimeout, HoglakeReadSessionVerifier verifier, TrinoFileSystemFactory fileSystemFactory)
     {
+        this(baseUri, requestTimeout, verifier, fileSystemFactory, ImmutableSet.of());
+    }
+
+    /**
+     * The same read session on the relayed routes of its own team schema. Every file must be
+     * inside a grant of one of {@code remoteTargets}; a local table is refused.
+     */
+    static HoglakeDedicatedReadPath forRemoteTeamSchema(
+            URI baseUri,
+            Duration requestTimeout,
+            HoglakeReadSessionVerifier verifier,
+            TrinoFileSystemFactory fileSystemFactory,
+            Set<String> remoteTargets)
+    {
+        if (remoteTargets == null || remoteTargets.size() != 2) {
+            throw new IllegalArgumentException("Invalid Hoglake read session configuration");
+        }
+        return new HoglakeDedicatedReadPath(baseUri, requestTimeout, verifier, fileSystemFactory, remoteTargets);
+    }
+
+    private HoglakeDedicatedReadPath(
+            URI baseUri,
+            Duration requestTimeout,
+            HoglakeReadSessionVerifier verifier,
+            TrinoFileSystemFactory fileSystemFactory,
+            Set<String> remoteTargets)
+    {
+        this.scope = new Scope(remoteTargets);
         this.verifier = requireNonNull(verifier, "verifier is null");
         this.baseUri = HoglakeClient.validateBaseUri(requireNonNull(baseUri, "baseUri is null").toASCIIString()).toString();
         String path = URI.create(this.baseUri).getRawPath();
@@ -171,10 +203,11 @@ final class HoglakeDedicatedReadPath
                 .build();
         this.sessionFileSystems = new DedicatedSessionFileSystemFactory(
                 verifier,
-                requireNonNull(fileSystemFactory, "fileSystemFactory is null"));
+                requireNonNull(fileSystemFactory, "fileSystemFactory is null"),
+                scope);
         this.splitManager = new DedicatedSplitManager();
         // Disable footer and data caches so workers never share state across callers.
-        this.pageSourceProvider = new DedicatedPageSourceProvider(verifier, new HoglakePageSourceProvider(sessionFileSystems));
+        this.pageSourceProvider = new DedicatedPageSourceProvider(verifier, new HoglakePageSourceProvider(sessionFileSystems), scope);
     }
 
     ConnectorMetadata metadata(ConnectorSession session, ConnectorTransactionHandle transaction)
@@ -284,9 +317,59 @@ final class HoglakeDedicatedReadPath
                 requestTimeout,
                 new HoglakeTokenSource.Fixed(context.token()),
                 httpClient,
-                createRouteGuard(basePath, context.catalog()),
-                true);
-        return new Reader(context.token(), context, client, new ConcurrentHashMap<>());
+                scope.remote()
+                        ? createRemoteRouteGuard(basePath, context.catalog(), scope.teamSchema(context))
+                        : createRouteGuard(basePath, context.catalog()),
+                !scope.remote());
+        return new Reader(context.token(), context, client, new ConcurrentHashMap<>(), scope);
+    }
+
+    /**
+     * The four relayed routes of one team schema, and nothing else: the schema, its table
+     * list, a table, and a pinned scan. No route takes any other query.
+     */
+    static HoglakeClient.RouteGuard createRemoteRouteGuard(String basePath, String verifiedCatalog, String teamSchema)
+    {
+        requireNonNull(basePath, "basePath is null");
+        requireNonNull(verifiedCatalog, "verifiedCatalog is null");
+        requireNonNull(teamSchema, "teamSchema is null");
+        String catalogPath = basePath + "/v1/catalogs/" + verifiedCatalog;
+        return (method, uri) -> {
+            if (!"GET".equals(method) || uri == null || uri.getRawFragment() != null) {
+                throw requestDenied();
+            }
+            String rawPath = uri.getRawPath();
+            if (rawPath == null || !rawPath.startsWith(catalogPath)) {
+                throw requestDenied();
+            }
+            String suffix = rawPath.substring(catalogPath.length());
+            String rawQuery = uri.getRawQuery();
+
+            Matcher namespaceMatch = NAMESPACE_ROUTE.matcher(suffix);
+            Matcher tablesMatch = TABLES_ROUTE.matcher(suffix);
+            Matcher tableMatch = TABLE_ROUTE.matcher(suffix);
+            Matcher scanMatch = SCAN_ROUTE.matcher(suffix);
+            if (namespaceMatch.matches() || tablesMatch.matches()) {
+                Matcher match = namespaceMatch.matches() ? namespaceMatch : tablesMatch;
+                if (!teamSchema.equals(match.group(1)) || rawQuery != null) {
+                    throw requestDenied();
+                }
+                return;
+            }
+            if (tableMatch.matches()) {
+                if (!teamSchema.equals(tableMatch.group(1)) || !isValidSegment(tableMatch.group(2)) || rawQuery != null) {
+                    throw requestDenied();
+                }
+                return;
+            }
+            if (scanMatch.matches()) {
+                if (!teamSchema.equals(scanMatch.group(1)) || !isValidSegment(scanMatch.group(2)) || !isValidPinnedScanQuery(rawQuery)) {
+                    throw requestDenied();
+                }
+                return;
+            }
+            throw requestDenied();
+        };
     }
 
     static HoglakeClient.RouteGuard createRouteGuard(String basePath, String verifiedCatalog)
@@ -407,29 +490,73 @@ final class HoglakeDedicatedReadPath
         }
     }
 
-    private static HoglakeTableHandle validateLocalTableHandle(ConnectorTableHandle table)
+    private static HoglakeTableHandle validateLocalTableHandle(ConnectorTableHandle table, Reader reader)
     {
-        if (!(table instanceof HoglakeTableHandle handle)) {
-            throw localTableDenied();
-        }
-        if (handle.remote()
-                || handle.snapshotId() < 0
-                || !isCanonicalUuid(handle.tableUuid())
-                || !handle.stagedFiles().isEmpty()
-                || !handle.stagedDeletes().isEmpty()) {
-            throw localTableDenied();
+        HoglakeTableHandle handle = reader.scope().validate(table, reader.context());
+        HoglakeTableHandle pinned = reader.pinnedTables().get(handle.schemaTableName());
+        if (pinned != null && (pinned.snapshotId() != handle.snapshotId() || !pinned.tableUuid().equals(handle.tableUuid()))) {
+            throw reader.scope().tableDenied();
         }
         return handle;
     }
 
-    private static HoglakeTableHandle validateLocalTableHandle(ConnectorTableHandle table, Reader reader)
+    /**
+     * What one read path reads. With no remote targets: local tables, whose files are inside
+     * the primary-catalog grant. With remote targets: tables of the session's own team schema,
+     * whose files are inside a grant of one of those targets.
+     */
+    private record Scope(Set<String> remoteTargets)
     {
-        HoglakeTableHandle handle = validateLocalTableHandle(table);
-        HoglakeTableHandle pinned = reader.pinnedTables().get(handle.schemaTableName());
-        if (pinned != null && (pinned.snapshotId() != handle.snapshotId() || !pinned.tableUuid().equals(handle.tableUuid()))) {
-            throw localTableDenied();
+        private Scope
+        {
+            remoteTargets = ImmutableSet.copyOf(requireNonNull(remoteTargets, "remoteTargets is null"));
         }
-        return handle;
+
+        boolean remote()
+        {
+            return !remoteTargets.isEmpty();
+        }
+
+        String teamSchema(HoglakeReadSessionContext context)
+        {
+            return "team_" + context.teamId();
+        }
+
+        TrinoException tableDenied()
+        {
+            return remote() ? new TrinoException(PERMISSION_DENIED, REMOTE_TABLE_DENIED) : localTableDenied();
+        }
+
+        void requireLocation(HoglakeReadSessionContext context, String location)
+        {
+            String region = context.storage().region();
+            if (!remote()) {
+                context.requireStorageLocation(context.catalog(), location, region);
+                return;
+            }
+            for (String target : remoteTargets) {
+                if (context.allowsStorageLocation(target, location, region)) {
+                    return;
+                }
+            }
+            throw targetDenied();
+        }
+
+        HoglakeTableHandle validate(ConnectorTableHandle table, HoglakeReadSessionContext context)
+        {
+            if (!(table instanceof HoglakeTableHandle handle)) {
+                throw tableDenied();
+            }
+            if (handle.remote() != remote()
+                    || (remote() && !teamSchema(context).equals(handle.schemaName()))
+                    || handle.snapshotId() < 0
+                    || !isCanonicalUuid(handle.tableUuid())
+                    || !handle.stagedFiles().isEmpty()
+                    || !handle.stagedDeletes().isEmpty()) {
+                throw tableDenied();
+            }
+            return handle;
+        }
     }
 
     private static List<HoglakeSplit> toLocalSplits(List<HoglakeDtos.ScanFile> scanFiles, long maxSplitSize)
@@ -509,7 +636,7 @@ final class HoglakeDedicatedReadPath
                 ImmutableList.of(),
                 false,
                 OptionalLong.empty(),
-                false);
+                handle.remote());
     }
 
     private static HoglakeColumnHandle toColumnHandle(HoglakeDtos.Column column)
@@ -556,7 +683,8 @@ final class HoglakeDedicatedReadPath
             String token,
             HoglakeReadSessionContext context,
             HoglakeClient client,
-            Map<SchemaTableName, HoglakeTableHandle> pinnedTables)
+            Map<SchemaTableName, HoglakeTableHandle> pinnedTables,
+            Scope scope)
     {
         HoglakeClient clientFor(ConnectorSession session)
         {
@@ -591,24 +719,22 @@ final class HoglakeDedicatedReadPath
                     .scanPinned(handle.schemaName(), handle.tableName(), handle.snapshotId(), handle.tableUuid());
 
             HoglakeReadSessionContext context = reader.context();
-            String primaryCatalog = context.catalog();
-            String region = context.storage().region();
 
             // Validate every returned file and deletion vector before emitting any split.
             for (HoglakeDtos.ScanFile file : scanFiles) {
                 if (file == null || file.dataFile() == null) {
-                    throw localTableDenied();
+                    throw scope.tableDenied();
                 }
                 HoglakeDtos.DataFile dataFile = file.dataFile();
-                context.requireStorageLocation(primaryCatalog, dataFile.path(), region);
+                scope.requireLocation(context, dataFile.path());
                 if (dataFile.fileSizeBytes() < 0) {
-                    throw localTableDenied();
+                    throw scope.tableDenied();
                 }
                 HoglakeDtos.DeleteFile deleteFile = file.deleteFile();
                 if (deleteFile != null) {
-                    context.requireStorageLocation(primaryCatalog, deleteFile.path(), region);
+                    scope.requireLocation(context, deleteFile.path());
                     if (deleteFile.dataFileId() != dataFile.dataFileId()) {
-                        throw localTableDenied();
+                        throw scope.tableDenied();
                     }
                 }
             }
@@ -645,23 +771,41 @@ final class HoglakeDedicatedReadPath
             if (schemaName == null || !schemaName.equals(schemaName.toLowerCase(ENGLISH))) {
                 return false;
             }
+            if (scope.remote() && !schemaName.equals(scope.teamSchema(reader.context()))) {
+                return false;
+            }
             return reader.clientFor(session).findNamespace(schemaName)
-                    .filter(namespace -> schemaName.equals(namespace.name()) && !namespace.isRemote())
+                    .filter(namespace -> schemaName.equals(namespace.name()) && namespace.isRemote() == scope.remote())
                     .isPresent();
         }
 
         @Override
         public List<String> listSchemaNames(ConnectorSession session)
         {
-            reader(session, transaction);
-            throw listingDenied();
+            Reader reader = reader(session, transaction);
+            if (!scope.remote()) {
+                throw listingDenied();
+            }
+            // The one schema this session can read. The catalog's other schemas are not listed to it.
+            String teamSchema = scope.teamSchema(reader.context());
+            return schemaExists(session, teamSchema) ? ImmutableList.of(teamSchema) : ImmutableList.of();
         }
 
         @Override
         public List<SchemaTableName> listTables(ConnectorSession session, Optional<String> schemaName)
         {
-            reader(session, transaction);
-            throw listingDenied();
+            Reader reader = reader(session, transaction);
+            if (!scope.remote()) {
+                throw listingDenied();
+            }
+            String teamSchema = scope.teamSchema(reader.context());
+            if ((schemaName.isPresent() && !schemaName.get().equals(teamSchema)) || !schemaExists(session, teamSchema)) {
+                return ImmutableList.of();
+            }
+            return reader.clientFor(session).listTables(teamSchema).stream()
+                    .filter(table -> table != null && table.name() != null && !table.name().isBlank())
+                    .map(table -> new SchemaTableName(teamSchema, table.name()))
+                    .collect(toImmutableList());
         }
 
         @Override
@@ -675,6 +819,9 @@ final class HoglakeDedicatedReadPath
             if (startVersion.isPresent() || endVersion.isPresent()) {
                 throw new TrinoException(NOT_SUPPORTED, "Table versioning is not supported by dedicated Hoglake local read");
             }
+            if (scope.remote() && !tableName.getSchemaName().equals(scope.teamSchema(reader.context()))) {
+                return null;
+            }
             HoglakeTableHandle cached = reader.pinnedTables().get(tableName);
             if (cached != null) {
                 return cached;
@@ -685,8 +832,8 @@ final class HoglakeDedicatedReadPath
                 return null;
             }
             HoglakeDtos.Table table = found.get();
-            if (table.isRemote()) {
-                throw localTableDenied();
+            if (table.isRemote() != scope.remote()) {
+                throw scope.tableDenied();
             }
             if (!tableName.getSchemaName().equals(table.namespace())
                     || !tableName.getTableName().equals(table.name())
@@ -695,7 +842,7 @@ final class HoglakeDedicatedReadPath
                     || table.readSnapshotId() < 0
                     || table.columns() == null
                     || table.columns().isEmpty()) {
-                throw localTableDenied();
+                throw scope.tableDenied();
             }
 
             List<HoglakeColumnHandle> columns = table.columns().stream()
@@ -703,7 +850,7 @@ final class HoglakeDedicatedReadPath
                     .collect(toImmutableList());
             if (columns.stream().anyMatch(column -> column.name() == null || column.name().isBlank())
                     || columns.stream().map(HoglakeColumnHandle::name).distinct().count() != columns.size()) {
-                throw localTableDenied();
+                throw scope.tableDenied();
             }
             HoglakeTableHandle handle = new HoglakeTableHandle(
                     tableName.getSchemaName(),
@@ -716,7 +863,7 @@ final class HoglakeDedicatedReadPath
                     ImmutableList.of(),
                     false,
                     OptionalLong.empty(),
-                    false);
+                    scope.remote());
             HoglakeTableHandle existing = reader.pinnedTables().putIfAbsent(tableName, handle);
             return existing != null ? existing : handle;
         }
@@ -1219,11 +1366,13 @@ final class HoglakeDedicatedReadPath
     {
         private final HoglakeReadSessionVerifier verifier;
         private final ConnectorPageSourceProvider delegate;
+        private final Scope scope;
 
-        private DedicatedPageSourceProvider(HoglakeReadSessionVerifier verifier, ConnectorPageSourceProvider delegate)
+        private DedicatedPageSourceProvider(HoglakeReadSessionVerifier verifier, ConnectorPageSourceProvider delegate, Scope scope)
         {
             this.verifier = requireNonNull(verifier, "verifier is null");
             this.delegate = requireNonNull(delegate, "delegate is null");
+            this.scope = requireNonNull(scope, "scope is null");
         }
 
         @Override
@@ -1238,16 +1387,14 @@ final class HoglakeDedicatedReadPath
                 MemoryContext memoryContext)
         {
             HoglakeReadSessionContext context = verifier.verify(session);
-            HoglakeTableHandle handle = validateLocalTableHandle(table);
+            HoglakeTableHandle handle = scope.validate(table, context);
             if (!(split instanceof HoglakeSplit hoglakeSplit)) {
-                throw localTableDenied();
+                throw scope.tableDenied();
             }
 
-            String primaryCatalog = context.catalog();
-            String region = context.storage().region();
-            context.requireStorageLocation(primaryCatalog, hoglakeSplit.path(), region);
+            scope.requireLocation(context, hoglakeSplit.path());
             if (hoglakeSplit.deleteFilePath().isPresent()) {
-                context.requireStorageLocation(primaryCatalog, hoglakeSplit.deleteFilePath().orElseThrow(), region);
+                scope.requireLocation(context, hoglakeSplit.deleteFilePath().orElseThrow());
             }
 
             HoglakeSplit localSplit = stripMetadataCount(hoglakeSplit);
@@ -1337,18 +1484,20 @@ final class HoglakeDedicatedReadPath
 
     /**
      * File system factory that injects only verified JWT AWS session credentials.
-     * Each returned file system enforces primary-catalog storage grants on every file open.
+     * Each returned file system enforces this path's storage grants on every file open.
      */
     private static final class DedicatedSessionFileSystemFactory
             implements TrinoFileSystemFactory
     {
         private final HoglakeReadSessionVerifier verifier;
         private final TrinoFileSystemFactory delegate;
+        private final Scope scope;
 
-        private DedicatedSessionFileSystemFactory(HoglakeReadSessionVerifier verifier, TrinoFileSystemFactory delegate)
+        private DedicatedSessionFileSystemFactory(HoglakeReadSessionVerifier verifier, TrinoFileSystemFactory delegate, Scope scope)
         {
             this.verifier = requireNonNull(verifier, "verifier is null");
             this.delegate = requireNonNull(delegate, "delegate is null");
+            this.scope = requireNonNull(scope, "scope is null");
         }
 
         @Override
@@ -1362,23 +1511,25 @@ final class HoglakeDedicatedReadPath
                             EXTRA_CREDENTIALS_SECRET_KEY_PROPERTY, storage.secretAccessKey(),
                             EXTRA_CREDENTIALS_SESSION_TOKEN_PROPERTY, storage.sessionToken()))
                     .build());
-            return new AuthorizingFileSystem(fileSystem, context);
+            return new AuthorizingFileSystem(fileSystem, context, scope);
         }
     }
 
     /**
-     * Read-only file system wrapper that enforces primary-catalog signed grants on every open.
+     * Read-only file system wrapper that enforces this path's signed grants on every open.
      */
     private static final class AuthorizingFileSystem
             implements TrinoFileSystem
     {
         private final TrinoFileSystem delegate;
         private final HoglakeReadSessionContext context;
+        private final Scope scope;
 
-        private AuthorizingFileSystem(TrinoFileSystem delegate, HoglakeReadSessionContext context)
+        private AuthorizingFileSystem(TrinoFileSystem delegate, HoglakeReadSessionContext context, Scope scope)
         {
             this.delegate = requireNonNull(delegate, "delegate is null");
             this.context = requireNonNull(context, "context is null");
+            this.scope = requireNonNull(scope, "scope is null");
         }
 
         private void authorize(Location location)
@@ -1386,7 +1537,7 @@ final class HoglakeDedicatedReadPath
             if (location == null) {
                 throw targetDenied();
             }
-            context.requireStorageLocation(context.catalog(), location.toString(), context.storage().region());
+            scope.requireLocation(context, location.toString());
         }
 
         @Override

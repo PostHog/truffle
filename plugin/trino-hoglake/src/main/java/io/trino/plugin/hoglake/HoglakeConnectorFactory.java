@@ -41,6 +41,7 @@ import io.trino.spi.connector.ConnectorSplitManager;
 import org.weakref.jmx.guice.MBeanModule;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -48,6 +49,7 @@ import java.util.UUID;
 
 import static io.airlift.configuration.ConfigBinder.configBinder;
 import static io.trino.plugin.base.Versions.checkStrictSpiVersionMatch;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 public class HoglakeConnectorFactory
@@ -232,11 +234,38 @@ public class HoglakeConnectorFactory
                 Injector injector)
         {
             Optional<HoglakeSharedReadPath> readPath = Optional.empty();
+            Optional<HoglakeDedicatedReadPath> readSessions = Optional.empty();
+            if (config.getReadSessionProfile().isPresent() != !config.getReadSessionRemoteTargets().isEmpty()
+                    || (config.getReadSessionProfile().isPresent() && storageRegion.isEmpty())) {
+                throw new IllegalArgumentException("Invalid shared Hoglake read session configuration");
+            }
             if (storageRegion.isPresent()) {
                 // Only the read path's bootstrap binds a file system
-                readPath = Optional.of(new HoglakeSharedReadPath(config, verifier, injector.getInstance(TrinoFileSystemFactory.class)));
+                TrinoFileSystemFactory fileSystemFactory = injector.getInstance(TrinoFileSystemFactory.class);
+                readPath = Optional.of(new HoglakeSharedReadPath(config, verifier, fileSystemFactory));
+                if (config.getReadSessionProfile().isPresent()) {
+                    // The same verifier, issuer, keys and limits as the dedicated catalog. Its grants
+                    // bound every file; its remote targets are the only ones this catalog reads.
+                    HoglakeReadSessionVerifier readSessionVerifier = new HoglakeReadSessionVerifier(
+                            config.getIssuer(),
+                            config.getJwksFile().toPath(),
+                            config.getReadSessionProfile().orElseThrow(),
+                            config.getReadSessionRemoteTargets(),
+                            verifier.hogliteBackends(),
+                            storageRegion,
+                            config.getClockSkew().roundTo(SECONDS),
+                            config.getScopedMaxLifetime().roundTo(SECONDS),
+                            Clock.systemUTC(),
+                            System::nanoTime);
+                    readSessions = Optional.of(HoglakeDedicatedReadPath.forRemoteTeamSchema(
+                            config.getUri(),
+                            Duration.ofNanos(config.getRequestTimeout().roundTo(NANOSECONDS)),
+                            readSessionVerifier,
+                            fileSystemFactory,
+                            config.getReadSessionRemoteTargets()));
+                }
             }
-            return new HoglakeSharedConnector(client, verifier, lifeCycleManager, readPath);
+            return new HoglakeSharedConnector(client, verifier, lifeCycleManager, readPath, readSessions);
         }
     }
 

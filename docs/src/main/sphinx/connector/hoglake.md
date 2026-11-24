@@ -148,7 +148,7 @@ The token must also satisfy all of the following:
 - `exp` is not later than `aws.expires_at`.
 - `sid`, `generation`, `session_deadline`, and `grants` are absent.
 
-Any other profile, version, or field is refused.
+Any other profile, version, or field is refused, unless the catalog accepts dedicated read sessions (see [](hoglake-shared-read-sessions)).
 A metadata token without a profile still discovers metadata and reads no table.
 
 A table handle exists only for a schema that meets all of the following:
@@ -182,6 +182,53 @@ When S3 refuses to open a file, the query fails with `PERMISSION_DENIED` and a m
 The read session properties `max_split_size`, `variant_path_assembly_enabled`, `variant_lazy_residual_enabled`, and `statistics_enabled` are available at their defaults.
 Table reads use the per-catalog HTTP client behind the route allowlist above.
 The `16MiB` metadata response ceiling does not apply to them, and their error messages can include the request URI and the response body.
+
+(hoglake-shared-read-sessions)=
+### Dedicated read sessions on a remote team schema
+
+The Phase 2.7 section of the [caller storage read specification](https://github.com/PostHog/hogtower/blob/main/docs/hoglite-caller-storage-read.md)
+defines this path.
+It is for development pools only.
+This implementation authorizes no deployment or activation.
+
+A shared catalog with remote reads can also accept the token of a dedicated read session.
+Set both of these properties, or neither:
+
+| Property | Description |
+| --- | --- |
+| `hoglake.shared.read-session-profile` | The exact token profile of dedicated read sessions. |
+| `hoglake.shared.read-session-remote-targets` | The two remote storage grant target names. |
+
+Both require `hoglake.shared.remote-read=true`.
+Without them, the catalog refuses a dedicated read session, as before.
+
+The token's audiences select the verifier.
+A token that names any of `trino-session`, `hoglake-session`, or `hoglite-session` is judged only by the dedicated read session verifier, with the same claim rules as a dedicated catalog.
+The verifier uses the shared catalog's issuer, key file, clock skew, and maximum lifetime.
+The token's `rtg` must name a `hoglite` backend from `hoglake.shared.backend-bindings`.
+Every other token is judged only by the shared verifier, unchanged.
+A token that mixes the audiences is refused by both.
+
+A read session reads only its own team schema: the canonical `team_<id>` of the single team in its `prd`.
+The catalog lists that schema and no other to it.
+The server must answer the namespace and each table as `remote`.
+A read sends only these GET routes, each with the caller's exact verified JWT:
+
+- `/v1/catalogs/{catalog}/namespaces/team_<id>`
+- `/v1/catalogs/{catalog}/namespaces/team_<id>/tables`
+- `/v1/catalogs/{catalog}/namespaces/team_<id>/tables/{table}`
+- `/v1/catalogs/{catalog}/namespaces/team_<id>/tables/{table}/scan?snapshot=<n>&table_uuid=<uuid>`
+
+No route carries any other query.
+The local-only routes are never used on this path.
+
+Every data file and deletion vector of a scan must be inside a grant of one of the two remote targets.
+The coordinator checks every path before it emits a split, and refuses the whole scan when one is outside.
+Each worker checks the paths of its split again, and the file system checks every file it opens.
+The token's grant for its primary catalog allows no file on this path.
+A count is always read from the Parquet files of a checked scan.
+The connector uses no row count from the table or from a scan answer, and reports no table statistics.
+Files are read with the token's `aws` session and nothing else.
 
 ### Compatibility and activation
 

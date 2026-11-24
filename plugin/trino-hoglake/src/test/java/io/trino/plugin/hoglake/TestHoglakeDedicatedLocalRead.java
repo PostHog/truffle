@@ -105,6 +105,7 @@ import static io.trino.plugin.hoglake.HoglakeReadSessionVerifier.DEFAULT_PROFILE
 import static io.trino.plugin.hoglake.HoglakeReadSessionVerifier.SESSION_TOKEN;
 import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.BACKEND_ID;
 import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.ISSUER;
+import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.claims;
 import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.keyPair;
 import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.token;
 import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.writeJwks;
@@ -216,6 +217,326 @@ final class TestHoglakeDedicatedLocalRead
                     REQUEST_DENIED,
                     "catalog-a");
         }
+    }
+
+    @Test
+    void testRemoteRouteGuardAllowsOnlyTheFourRoutesOfTheTeamSchema()
+    {
+        HoglakeClient.RouteGuard guard = HoglakeDedicatedReadPath.createRemoteRouteGuard("", "catalog-a", "team_4");
+        String team = "/v1/catalogs/catalog-a/namespaces/team_4";
+
+        guard.check("GET", URI.create("http://metadata.example.test" + team));
+        guard.check("GET", URI.create("http://metadata.example.test" + team + "/tables"));
+        guard.check("GET", URI.create("http://metadata.example.test" + team + "/tables/events"));
+        guard.check("GET", URI.create("http://metadata.example.test" + team + "/tables/events/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID));
+
+        List<String> disallowedPaths = List.of(
+                // Another team, a local schema, another catalog and the local-only routes are never sent.
+                "/v1/catalogs/catalog-a/namespaces/team_5",
+                "/v1/catalogs/catalog-a/namespaces/team_04",
+                "/v1/catalogs/catalog-a/namespaces/TEAM_4",
+                "/v1/catalogs/catalog-a/namespaces/reports",
+                "/v1/catalogs/catalog-a/namespaces/team_5/tables",
+                "/v1/catalogs/catalog-a/namespaces/team_5/tables/events",
+                "/v1/catalogs/catalog-a/namespaces/team_5/tables/events/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID,
+                "/v1/catalogs/catalog-b/namespaces/team_4",
+                "/v1/local-only/catalogs/catalog-a/namespaces/team_4",
+                "/v1/catalogs/catalog-a",
+                "/v1/catalogs/catalog-a/namespaces",
+                team + "?x=1",
+                team + "/tables?snapshot=5",
+                team + "/tables/events?snapshot=5",
+                team + "/tables/events?totals=true",
+                team + "/tables/events/files",
+                team + "/tables/events/scan",
+                team + "/tables/events/scan?snapshot=5",
+                team + "/tables/events/scan?table_uuid=" + ALICE_TABLE_UUID,
+                team + "/tables/events/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID + "&include=column_stats",
+                team + "/tables/..%2fother",
+                team + "/tables/events#fragment");
+        for (String path : disallowedPaths) {
+            assertRedactedDenial(
+                    () -> guard.check("GET", URI.create("http://metadata.example.test" + path)),
+                    REQUEST_DENIED,
+                    path);
+        }
+        for (String method : List.of("POST", "PUT", "DELETE", "PATCH")) {
+            assertRedactedDenial(() -> guard.check(method, URI.create("http://metadata.example.test" + team)), REQUEST_DENIED, "catalog-a");
+        }
+    }
+
+    @Test
+    void testRemoteTeamSchemaReadsAndCountsOnlyGrantCheckedFiles()
+            throws Exception
+    {
+        KeyPair key = keyPair();
+        Path jwksFile = directory.resolve("remote-jwks.json");
+        writeJwks(jwksFile, key, KID);
+
+        CallerFixture alice = caller(key, "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSA", "SECRETA", "TOKENA");
+        byte[] parquetBytes = writeMetricsParquet(List.of(101L, 202L, 303L), List.of("alpha", "beta", "gamma"));
+        String dataPath = "s3://example-remote/events/team_id=4/part-0.parquet";
+        CredentialCheckingFileSystemFactory fileSystems = new CredentialCheckingFileSystemFactory(
+                Map.of(alice.credentials(), Map.of(dataPath, parquetBytes)));
+
+        List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
+        try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> routeRemoteTable(request, "catalog-a", "team_4", "events", ALICE_TABLE_UUID, 5L, dataPath, parquetBytes.length, 999L, null));
+                HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forRemoteTeamSchema(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), fileSystems, REMOTE_TARGETS);
+                StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+            Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
+
+            MaterializedResult rows = runner.execute(session, "SELECT id, label FROM hoglake.team_4.events ORDER BY id");
+            assertThat(rows.getMaterializedRows())
+                    .extracting(row -> List.of(row.getField(0), row.getField(1)))
+                    .containsExactly(List.of(101L, "alpha"), List.of(202L, "beta"), List.of(303L, "gamma"));
+
+            // The Host reports 999 rows for the table and for the file. The count comes from the Parquet file.
+            int readsBeforeCount = fileSystems.reads().size();
+            assertThat(runner.execute(session, "SELECT count(*) FROM hoglake.team_4.events").getOnlyValue()).isEqualTo(3L);
+            assertThat(fileSystems.reads().size()).isGreaterThan(readsBeforeCount);
+
+            // The session sees its own team schema and that schema's tables, and no other schema.
+            assertThat(runner.execute(session, "SHOW SCHEMAS FROM hoglake").getOnlyColumnAsSet())
+                    .containsExactlyInAnyOrder("information_schema", "team_4");
+            assertThat(runner.execute(session, "SHOW TABLES FROM hoglake.team_4").getOnlyColumnAsSet())
+                    .containsExactly("events");
+            for (String refused : List.of(
+                    "SELECT * FROM hoglake.team_5.events",
+                    "SELECT * FROM hoglake.reports.metrics",
+                    "SHOW TABLES FROM hoglake.team_5",
+                    "INSERT INTO hoglake.team_4.events VALUES (404, 'delta')",
+                    "DELETE FROM hoglake.team_4.events")) {
+                assertThatThrownBy(() -> runner.execute(session, refused)).as(refused).isInstanceOf(QueryFailedException.class);
+            }
+
+            // Every request is the caller's exact token on one of the four relayed routes, never a local-only one.
+            assertThat(requests).isNotEmpty().allSatisfy(request -> {
+                assertThat(request.method()).isEqualTo("GET");
+                assertThat(request.authorization()).isEqualTo("Bearer " + alice.jwt());
+                assertThat(request.isLocalOnly()).isFalse();
+                assertThat(request.rawPathAndQuery()).isIn(
+                        "/v1/catalogs/catalog-a/namespaces/team_4",
+                        "/v1/catalogs/catalog-a/namespaces/team_4/tables",
+                        "/v1/catalogs/catalog-a/namespaces/team_4/tables/events",
+                        "/v1/catalogs/catalog-a/namespaces/team_4/tables/events/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID);
+            });
+        }
+        assertThat(fileSystems.reads()).isNotEmpty().allSatisfy(read -> {
+            assertThat(read.credentials()).isEqualTo(alice.credentials());
+            assertThat(read.location()).isEqualTo(dataPath);
+        });
+    }
+
+    @Test
+    void testRemoteTeamSchemaRefusesAFileOutsideTheRemoteGrantsBeforeAnyRead()
+            throws Exception
+    {
+        KeyPair key = keyPair();
+        Path jwksFile = directory.resolve("remote-denied-jwks.json");
+        writeJwks(jwksFile, key, KID);
+
+        CallerFixture alice = caller(key, "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSA", "SECRETA", "TOKENA");
+        byte[] parquetBytes = writeMetricsParquet(List.of(101L, 202L, 303L), List.of("alpha", "beta", "gamma"));
+        String granted = "s3://example-remote/events/team_id=4/part-0.parquet";
+        // Another team's prefix, the session's own local catalog prefix, a sibling prefix, and another bucket.
+        List<String> outside = List.of(
+                "s3://example-remote/events/team_id=5/part-0.parquet",
+                "s3://example-remote/events/team_id=40/part-0.parquet",
+                alice.tableFile("metrics/part-0.parquet"),
+                "s3://example-other/events/team_id=4/part-0.parquet",
+                "s3://example-remote/events/team_id=4/../team_id=5/part-0.parquet");
+        for (String dataPath : outside) {
+            for (boolean vector : List.of(false, true)) {
+                // Either the data file is outside, or the data file is inside and only its deletion vector is outside.
+                String file = vector ? granted : dataPath;
+                String deletePath = vector ? dataPath : null;
+                CredentialCheckingFileSystemFactory fileSystems = new CredentialCheckingFileSystemFactory(
+                        Map.of(alice.credentials(), Map.of(granted, parquetBytes, dataPath, parquetBytes)));
+                List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
+                try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> routeRemoteTable(request, "catalog-a", "team_4", "events", ALICE_TABLE_UUID, 5L, file, parquetBytes.length, 999L, deletePath));
+                        HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forRemoteTeamSchema(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), fileSystems, REMOTE_TARGETS);
+                        StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                    Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
+                    // A count that metadata alone could answer is refused like a read of the rows.
+                    for (String sql : List.of("SELECT count(*) FROM hoglake.team_4.events", "SELECT id FROM hoglake.team_4.events")) {
+                        assertThatThrownBy(() -> runner.execute(session, sql))
+                                .as("%s %s %s", dataPath, vector, sql)
+                                .isInstanceOf(QueryFailedException.class)
+                                .hasMessage(TARGET_DENIED)
+                                .satisfies(failure -> assertThat(failure.toString()).doesNotContain("part-0", "team_id", alice.jwt()));
+                    }
+                }
+                assertThat(fileSystems.reads()).as("%s %s", dataPath, vector).isEmpty();
+            }
+        }
+    }
+
+    @Test
+    void testRemoteTeamSchemaRefusesALocalTableAndAnotherSessionsTeam()
+            throws Exception
+    {
+        KeyPair key = keyPair();
+        Path jwksFile = directory.resolve("remote-local-jwks.json");
+        writeJwks(jwksFile, key, KID);
+
+        CallerFixture alice = caller(key, "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSA", "SECRETA", "TOKENA");
+        CredentialCheckingFileSystemFactory fileSystems = new CredentialCheckingFileSystemFactory(Map.of());
+        List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
+        // The server answers team_4 as a local namespace with a local table: a name collision, not a relay.
+        try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> routeLocalTable(request, "catalog-a", "team_4", "events", ALICE_TABLE_UUID, 5L, "s3://example-remote/events/team_id=4/part-0.parquet", 10, 1L, null));
+                HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forRemoteTeamSchema(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), fileSystems, REMOTE_TARGETS);
+                StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+            Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
+            assertThatThrownBy(() -> runner.execute(session, "SELECT id FROM hoglake.team_4.events"))
+                    .isInstanceOf(QueryFailedException.class);
+            assertThatThrownBy(() -> runner.execute(session, "SELECT id FROM hoglake.team_5.events"))
+                    .isInstanceOf(QueryFailedException.class);
+            assertThat(requests).extracting(RecordedRequest::rawPathAndQuery)
+                    .allSatisfy(target -> assertThat(target).startsWith("/v1/catalogs/catalog-a/namespaces/team_4"))
+                    .noneMatch(target -> target.contains("/scan"));
+        }
+        assertThat(fileSystems.reads()).isEmpty();
+    }
+
+    @Test
+    void testSharedCatalogSelectsTheReadSessionPathByAudience()
+            throws Exception
+    {
+        KeyPair key = keyPair();
+        Path jwksFile = directory.resolve("shared-read-session-jwks.json");
+        writeJwks(jwksFile, key, KID);
+        CallerFixture alice = callerAt(key, Instant.now(), "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSLIVE", "SECRETLIVE", "TOKENLIVE");
+        Map<String, Object> storageSession = claims("catalog-a", "example.alice", "tenant_1", Instant.now());
+        storageSession.put("profile", "storage-session");
+        storageSession.put("version", 1);
+        storageSession.put("purpose", "user-session");
+        storageSession.put("primary_catalog", "catalog-a");
+        storageSession.put("remote_schemas", Map.of("team", List.of("read")));
+        storageSession.put("aws", Map.of(
+                "access_key_id", "synthetic-access-key",
+                "secret_access_key", "synthetic-secret-key",
+                "session_token", "synthetic-session-token",
+                "region", REGION,
+                "expires_at", ((Number) storageSession.get("exp")).longValue() + 60));
+        String storageSessionJwt = token(key, KID, storageSession);
+
+        List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
+        // Both team schemas are remote and empty, so storage is never reached.
+        try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> {
+            Response team4 = routeRemoteTable(request, "catalog-a", "team_4", "events", ALICE_TABLE_UUID, 5L, null, 0, 999L, null);
+            return team4.status() != 404 ? team4 : routeRemoteTable(request, "catalog-a", "team_7", "events", BOB_TABLE_UUID, 6L, null, 0, 999L, null);
+        })) {
+            ImmutableMap.Builder<String, String> properties = ImmutableMap.<String, String>builder()
+                    .put("hoglake.multi-tenant", "true")
+                    .put("hoglake.uri", server.baseUri().toString())
+                    .put("hoglake.shared.jwks-file", jwksFile.toString())
+                    .put("hoglake.shared.issuer", ISSUER)
+                    .put("hoglake.shared.backend-bindings", "{\"%s\":\"hoglite\"}".formatted(BACKEND_ID))
+                    .put("hoglake.shared.remote-read", "true")
+                    .put("s3.endpoint", "http://127.0.0.1:9")
+                    .put("s3.region", REGION);
+            Map<String, String> withoutReadSessions = properties.buildOrThrow();
+            Map<String, String> withReadSessions = ImmutableMap.<String, String>builder()
+                    .putAll(withoutReadSessions)
+                    .put("hoglake.shared.read-session-profile", DEFAULT_PROFILE)
+                    .put("hoglake.shared.read-session-remote-targets", EVENTS_TARGET + "," + IMPORTS_TARGET)
+                    .buildOrThrow();
+
+            Session readSession = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
+            Session shared = querySession(alice.mappedUser(), alice.principal(), storageSessionJwt, "team_7");
+            try (StandaloneQueryRunner runner = sharedRunner(withReadSessions)) {
+                // The read session: its own team schema, with a pinned scan that names the table.
+                assertThat(runner.execute(readSession, "SELECT count(*) FROM hoglake.team_4.events").getOnlyValue()).isEqualTo(0L);
+                assertThat(runner.execute(readSession, "SHOW TABLES FROM hoglake.team_4").getOnlyColumnAsSet()).containsExactly("events");
+                assertThat(requests).isNotEmpty().allSatisfy(request -> {
+                    assertThat(request.authorization()).isEqualTo("Bearer " + alice.jwt());
+                    assertThat(request.isLocalOnly()).isFalse();
+                    assertThat(request.rawPathAndQuery()).startsWith("/v1/catalogs/catalog-a/namespaces/team_4");
+                });
+                assertThat(requests).extracting(RecordedRequest::rawPathAndQuery)
+                        .contains("/v1/catalogs/catalog-a/namespaces/team_4/tables/events/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID);
+                // It reads no other team's schema, even one that the catalog relays.
+                assertThatThrownBy(() -> runner.execute(readSession, "SELECT count(*) FROM hoglake.team_7.events"))
+                        .isInstanceOf(QueryFailedException.class);
+                assertThat(requests).extracting(RecordedRequest::rawPathAndQuery).noneMatch(target -> target.contains("team_7"));
+
+                // The first profile is unchanged on the same catalog.
+                requests.clear();
+                assertThat(runner.execute(shared, "SELECT count(*) FROM hoglake.team_7.events").getOnlyValue()).isEqualTo(0L);
+                assertThat(requests).isNotEmpty().allSatisfy(request -> assertThat(request.authorization()).isEqualTo("Bearer " + storageSessionJwt));
+            }
+
+            // Without the two properties the catalog refuses the read session, as before.
+            requests.clear();
+            try (StandaloneQueryRunner runner = sharedRunner(withoutReadSessions)) {
+                assertThatThrownBy(() -> runner.execute(readSession, "SELECT count(*) FROM hoglake.team_4.events"))
+                        .isInstanceOf(QueryFailedException.class)
+                        .hasMessageContaining("Shared Hoglake session");
+                assertThat(requests).isEmpty();
+            }
+
+            // One property without the other, or either without remote read, does not start.
+            for (Map<String, String> invalid : List.of(
+                    ImmutableMap.<String, String>builder().putAll(withoutReadSessions).put("hoglake.shared.read-session-profile", DEFAULT_PROFILE).buildOrThrow(),
+                    ImmutableMap.<String, String>builder().putAll(withoutReadSessions).put("hoglake.shared.read-session-remote-targets", EVENTS_TARGET + "," + IMPORTS_TARGET).buildOrThrow(),
+                    ImmutableMap.<String, String>builder().putAll(withoutReadSessions).put("hoglake.shared.read-session-profile", DEFAULT_PROFILE).put("hoglake.shared.read-session-remote-targets", EVENTS_TARGET).buildOrThrow())) {
+                assertThatThrownBy(() -> sharedRunner(invalid).close()).as(invalid.toString()).isInstanceOf(RuntimeException.class);
+            }
+        }
+    }
+
+    private static StandaloneQueryRunner sharedRunner(Map<String, String> properties)
+    {
+        StandaloneQueryRunner runner = new StandaloneQueryRunner(testSessionBuilder().setCatalog("hoglake").setSchema("team_4").build());
+        try {
+            runner.installPlugin(new HoglakePlugin());
+            runner.createCatalog("hoglake", "hoglake", properties);
+            return runner;
+        }
+        catch (RuntimeException | Error exception) {
+            runner.close();
+            throw exception;
+        }
+    }
+
+    /**
+     * A relayed team schema with one table. A null {@code dataPath} is an empty table. The scan
+     * answers any query, so a test can assert the query the reader sent.
+     */
+    private static Response routeRemoteTable(
+            RecordedRequest request,
+            String catalog,
+            String namespace,
+            String table,
+            String tableUuid,
+            long readSnapshotId,
+            String dataPath,
+            long fileSizeBytes,
+            long metadataRecordCount,
+            String deletePath)
+    {
+        String prefix = "/v1/catalogs/" + catalog + "/namespaces/" + namespace;
+        if (request.isLocalOnly()) {
+            return new Response(404, "{}");
+        }
+        if (request.rawPathAndQuery().equals(prefix)) {
+            return new Response(200, "{\"name\":\"%s\",\"remote\":true}".formatted(namespace));
+        }
+        if (request.rawPathAndQuery().equals(prefix + "/tables")) {
+            return new Response(200, "[{\"name\":\"%s\",\"table_uuid\":\"%s\"}]".formatted(table, tableUuid));
+        }
+        if (request.rawPath().equals(prefix + "/tables/" + table + "/scan") && dataPath == null) {
+            return new Response(200, "[]");
+        }
+        if (request.rawPath().equals(prefix + "/tables/" + table)) {
+            // The table answers any query: the first profile's reader sends totals=false or a snapshot.
+            request = new RecordedRequest(request.method(), request.rawPath(), request.rawPath(), request.authorization(), request.securityToken(), request.range(), false, request.wirePathAndQuery());
+        }
+        Response local = routeLocalTable(request, catalog, namespace, table, tableUuid, readSnapshotId, dataPath, fileSizeBytes, metadataRecordCount, deletePath);
+        if (local.status() == 200 && request.rawPath().equals(prefix + "/tables/" + table)) {
+            return new Response(200, new String(local.body(), UTF_8).replace("\"remote\": false", "\"remote\": true"));
+        }
+        return local;
     }
 
     @Test
