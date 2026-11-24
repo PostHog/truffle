@@ -124,6 +124,8 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
 /**
  * Dedicated local table read path backed by offline read session verification.
  * Each transaction uses only the caller's verified JWT and AWS session credentials.
+ * Every metadata and pinned scan request uses Hoglake's local-only routes, so a remote
+ * schema is never relayed, even one whose name collides with a local namespace.
  */
 final class HoglakeDedicatedReadPath
         implements AutoCloseable
@@ -274,13 +276,16 @@ final class HoglakeDedicatedReadPath
 
     private Reader newReader(HoglakeReadSessionContext context)
     {
+        // Local-only routes: Hoglake reads only the caller's own local warehouse and never relays a
+        // remote schema. A missing name is ordinary absence. An answer without the marker is refused.
         HoglakeClient client = new HoglakeClient(
                 baseUri,
                 context.catalog(),
                 requestTimeout,
                 new HoglakeTokenSource.Fixed(context.token()),
                 httpClient,
-                createRouteGuard(basePath, context.catalog()));
+                createRouteGuard(basePath, context.catalog()),
+                true);
         return new Reader(context.token(), context, client, new ConcurrentHashMap<>());
     }
 
@@ -288,7 +293,8 @@ final class HoglakeDedicatedReadPath
     {
         requireNonNull(basePath, "basePath is null");
         requireNonNull(verifiedCatalog, "verifiedCatalog is null");
-        String catalogPath = basePath + "/v1/catalogs/" + verifiedCatalog;
+        // Only the local-only routes. An ordinary route, which a remote schema can relay, is denied.
+        String catalogPath = basePath + HoglakeClient.LOCAL_ONLY_PREFIX + "/catalogs/" + verifiedCatalog;
         return (method, uri) -> {
             if (!"GET".equals(method) || uri == null || uri.getRawFragment() != null) {
                 throw requestDenied();
