@@ -222,6 +222,15 @@ public class HoglakeMetadata
     }
 
     /**
+     * Whether the server has a namespace of this name for this caller: the same
+     * answer, asked once per transaction, that decides whether the schema is remote.
+     */
+    boolean hasNamespace(String schemaName)
+    {
+        return namespace(schemaName).isPresent();
+    }
+
+    /**
      * Whether the server says the schema is remote: served by another Hoglake through
      * this catalog's server, with snapshots of its own. Never inferred from the name.
      */

@@ -389,7 +389,14 @@ public final class HoglakeSharedConnector
             if (readPath.isEmpty() || !verifier.verify(session).readsTeamSchema(tableName.getSchemaName())) {
                 throw denyExecution(session);
             }
-            ConnectorTableHandle handle = readPath.get().reader(session, transaction).metadata().getTableHandle(session, tableName, startVersion, endVersion);
+            HoglakeMetadata metadata = readPath.get().reader(session, transaction).metadata();
+            // A team schema the server does not have (404) is a missing schema, not a
+            // local one: no table or snapshot of this catalog is asked for. Time travel
+            // is still refused by the metadata before any request.
+            if (startVersion.isEmpty() && endVersion.isEmpty() && !metadata.hasNamespace(tableName.getSchemaName())) {
+                return null;
+            }
+            ConnectorTableHandle handle = metadata.getTableHandle(session, tableName, startVersion, endVersion);
             if (handle == null) {
                 return null;
             }

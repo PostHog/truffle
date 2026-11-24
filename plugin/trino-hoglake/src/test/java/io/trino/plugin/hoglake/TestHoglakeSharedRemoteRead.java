@@ -62,8 +62,12 @@ import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.session;
 import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.token;
 import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.writeJwks;
 import static io.trino.plugin.hoglake.HoglakeSharedSessionVerifier.SESSION_TOKEN;
+import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.trino.spi.StandardErrorCode.PERMISSION_DENIED;
+import static io.trino.spi.StandardErrorCode.SCHEMA_NOT_FOUND;
+import static io.trino.spi.StandardErrorCode.TABLE_NOT_FOUND;
 import static io.trino.testing.TestingSession.testSessionBuilder;
+import static io.trino.testing.assertions.TrinoExceptionAssert.assertTrinoExceptionThrownBy;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -398,6 +402,72 @@ final class TestHoglakeSharedRemoteRead
     }
 
     @Test
+    void testATeamSchemaTheServerDoesNotHaveIsAMissingSchema()
+            throws Exception
+    {
+        try (Fixture fixture = new Fixture(directory);
+                StandaloneQueryRunner runner = fixture.queryRunner(true)) {
+            // A grant of every team of the caller's organization reads any team_<id> by name
+            Map<String, Object> claims = profileClaims(Instant.now());
+            claims.put("prd", new LinkedHashMap<>(Map.of("team_id", new LinkedHashMap<>(Map.of("*", "read")))));
+            String jwt = token(fixture.key, KEY_ID, claims);
+            Session session = querySession(jwt);
+
+            // A team of another organization, and a team that exists nowhere: the server
+            // answers the namespace 404, and the caller sees a missing schema. Nothing
+            // but that namespace and the engine's schema check is asked: never this
+            // catalog's snapshot, and no table.
+            for (String schema : List.of("team_4242", "team_999999999")) {
+                fixture.requests.clear();
+                assertTrinoExceptionThrownBy(() -> runner.execute(session, "SELECT count(*) FROM hoglake.%s.events".formatted(schema)))
+                        .hasErrorCode(SCHEMA_NOT_FOUND)
+                        .hasMessageContaining("Schema '%s' does not exist".formatted(schema));
+                assertThat(fixture.requests).extracting(Request::path)
+                        .startsWith(CATALOG_PATH + "/namespaces/" + schema)
+                        .allSatisfy(path -> assertThat(path).isIn(CATALOG_PATH + "/namespaces/" + schema, CATALOG_PATH + "/namespaces"));
+                assertThat(fixture.requests).allSatisfy(request -> {
+                    assertThat(request.method()).isEqualTo("GET");
+                    assertThat(request.authorization()).isEqualTo("Bearer " + jwt);
+                });
+            }
+
+            // A missing table of a remote team schema: the namespace and the table are
+            // asked, and the caller sees a missing table
+            fixture.requests.clear();
+            assertTrinoExceptionThrownBy(() -> runner.execute(session, "SELECT count(*) FROM hoglake.team_7.missing"))
+                    .hasErrorCode(TABLE_NOT_FOUND)
+                    .hasMessageContaining("Table 'hoglake.team_7.missing' does not exist");
+            assertThat(fixture.requests).extracting(Request::path)
+                    .startsWith(CATALOG_PATH + "/namespaces/team_7", CATALOG_PATH + "/namespaces/team_7/tables/missing")
+                    .allSatisfy(path -> assertThat(path).isIn(
+                            CATALOG_PATH + "/namespaces/team_7",
+                            CATALOG_PATH + "/namespaces/team_7/tables/missing",
+                            CATALOG_PATH + "/namespaces"));
+
+            // A namespace the server has but does not call remote is still refused,
+            // after that one request: the name never makes a schema remote
+            fixture.requests.clear();
+            assertTrinoExceptionThrownBy(() -> runner.execute(session, "SELECT count(*) FROM hoglake.team_9.events"))
+                    .hasErrorCode(PERMISSION_DENIED)
+                    .hasMessageContaining("Shared Hoglake session authority does not allow this read");
+            assertThat(fixture.requests).extracting(Request::target).containsExactly(CATALOG_PATH + "/namespaces/team_9");
+
+            // A remote team schema still reads
+            fixture.requests.clear();
+            assertThat(runner.execute(session, "SELECT count(*) FROM hoglake.team_7.events").getOnlyValue()).isEqualTo(0L);
+            assertThat(fixture.requests).extracting(Request::path).contains(CATALOG_PATH + "/namespaces/team_7/tables/events/scan");
+
+            // A token that holds listed teams asks nothing for a team it does not hold
+            Session listed = querySession(fixture.profileToken());
+            fixture.requests.clear();
+            assertTrinoExceptionThrownBy(() -> runner.execute(listed, "SELECT count(*) FROM hoglake.team_4242.events"))
+                    .hasErrorCode(NOT_SUPPORTED)
+                    .hasMessageContaining(READS_REMOTE_ONLY);
+            assertThat(fixture.requests).isEmpty();
+        }
+    }
+
+    @Test
     void testTwoCallersReadOnlyWithTheirOwnTokens()
             throws Exception
     {
@@ -680,6 +750,11 @@ final class TestHoglakeSharedRemoteRead
             if (path.equals(namespaces + "/team_9")) {
                 // A local namespace with a team's name
                 return "{\"name\":\"team_9\",\"namespace_id\":9}";
+            }
+            if (path.equals(namespaces + "/team_4242") || path.equals(namespaces + "/team_999999999")) {
+                // A team of another organization, and a team that exists nowhere: the
+                // server has no such namespace for this caller
+                return null;
             }
             if (path.equals(events)) {
                 return "{\"name\":\"events\",\"namespace\":\"team_7\",\"table_uuid\":\"uuid-events\",\"columns\":[{\"name\":\"v\",\"type\":\"long\",\"nullable\":true,\"field_id\":1,\"ordinal\":0}],\"read_snapshot_id\":9001,\"properties\":{},\"remote\":true}";
