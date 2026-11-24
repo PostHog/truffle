@@ -386,7 +386,17 @@ public final class HoglakeSharedConnector
         {
             // Decided from the verified token alone, before any request: only a team
             // schema the token holds is looked up at all
-            if (readPath.isEmpty() || !verifier.verify(session).readsTeamSchema(tableName.getSchemaName())) {
+            if (readPath.isEmpty()) {
+                throw denyExecution(session);
+            }
+            HoglakeSharedSessionContext context = verifier.verify(session);
+            if (!context.readsTeamSchema(tableName.getSchemaName())) {
+                // A team schema the token does not hold answers as one that does not
+                // exist, with no request for it: "not yours" and "no such team" are
+                // the same answer, so team ids cannot be probed
+                if (startVersion.isEmpty() && endVersion.isEmpty() && context.isTeamSchemaOutsideGrant(tableName.getSchemaName())) {
+                    return null;
+                }
                 throw denyExecution(session);
             }
             HoglakeMetadata metadata = readPath.get().reader(session, transaction).metadata();
