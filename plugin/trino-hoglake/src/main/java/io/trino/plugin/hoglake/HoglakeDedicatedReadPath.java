@@ -27,6 +27,7 @@ import io.trino.plugin.hoglake.HoglakeReadSessionContext.StorageSession;
 import io.trino.plugin.hoglake.rest.HoglakeClient;
 import io.trino.plugin.hoglake.rest.HoglakeDtos;
 import io.trino.plugin.hoglake.rest.HoglakeTokenSource;
+import io.trino.spi.ErrorCode;
 import io.trino.spi.RefreshType;
 import io.trino.spi.SplitWeight;
 import io.trino.spi.TrinoException;
@@ -108,6 +109,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -136,6 +138,7 @@ final class HoglakeDedicatedReadPath
     private static final String REQUEST_DENIED = "Dedicated Hoglake read session does not allow this request";
     private static final String LOCAL_TABLE_DENIED = "Dedicated Hoglake local read requires a valid pinned local table";
 
+    private static final String DISCOVERY_FAILED = "Hoglake read session metadata request failed";
     private static final String REMOTE_TABLE_DENIED = "Hoglake read session requires a valid pinned table of its own team schema";
     private static final Pattern NAMESPACE_ROUTE = Pattern.compile("/namespaces/([^/]+)");
     private static final Pattern TABLES_ROUTE = Pattern.compile("/namespaces/([^/]+)/tables");
@@ -522,6 +525,13 @@ final class HoglakeDedicatedReadPath
             return "team_" + context.teamId();
         }
 
+        TrinoException listingDenied()
+        {
+            return remote()
+                    ? new TrinoException(NOT_SUPPORTED, "Hoglake read session does not support this listing")
+                    : HoglakeDedicatedReadPath.listingDenied();
+        }
+
         TrinoException tableDenied()
         {
             return remote() ? new TrinoException(PERMISSION_DENIED, REMOTE_TABLE_DENIED) : localTableDenied();
@@ -774,9 +784,31 @@ final class HoglakeDedicatedReadPath
             if (scope.remote() && !schemaName.equals(scope.teamSchema(reader.context()))) {
                 return false;
             }
-            return reader.clientFor(session).findNamespace(schemaName)
+            return discover(() -> reader.clientFor(session).findNamespace(schemaName))
                     .filter(namespace -> schemaName.equals(namespace.name()) && namespace.isRemote() == scope.remote())
                     .isPresent();
+        }
+
+        /**
+         * A discovery request of a remote read session. A failure keeps its error code and
+         * loses its message and cause: the client's message can hold the request URI and
+         * the response body.
+         */
+        private <T> T discover(Supplier<T> request)
+        {
+            if (!scope.remote()) {
+                return request.get();
+            }
+            try {
+                return request.get();
+            }
+            catch (TrinoException e) {
+                if (PERMISSION_DENIED.toErrorCode().equals(e.getErrorCode())) {
+                    throw requestDenied();
+                }
+                ErrorCode code = e.getErrorCode();
+                throw new TrinoException(() -> code, DISCOVERY_FAILED);
+            }
         }
 
         @Override
@@ -784,7 +816,7 @@ final class HoglakeDedicatedReadPath
         {
             Reader reader = reader(session, transaction);
             if (!scope.remote()) {
-                throw listingDenied();
+                throw scope.listingDenied();
             }
             // The one schema this session can read. The catalog's other schemas are not listed to it.
             String teamSchema = scope.teamSchema(reader.context());
@@ -796,13 +828,13 @@ final class HoglakeDedicatedReadPath
         {
             Reader reader = reader(session, transaction);
             if (!scope.remote()) {
-                throw listingDenied();
+                throw scope.listingDenied();
             }
             String teamSchema = scope.teamSchema(reader.context());
             if ((schemaName.isPresent() && !schemaName.get().equals(teamSchema)) || !schemaExists(session, teamSchema)) {
                 return ImmutableList.of();
             }
-            return reader.clientFor(session).listTables(teamSchema).stream()
+            return discover(() -> reader.clientFor(session).listTables(teamSchema)).stream()
                     .filter(table -> table != null && table.name() != null && !table.name().isBlank())
                     .map(table -> new SchemaTableName(teamSchema, table.name()))
                     .collect(toImmutableList());
@@ -817,7 +849,9 @@ final class HoglakeDedicatedReadPath
         {
             Reader reader = reader(session, transaction);
             if (startVersion.isPresent() || endVersion.isPresent()) {
-                throw new TrinoException(NOT_SUPPORTED, "Table versioning is not supported by dedicated Hoglake local read");
+                throw new TrinoException(NOT_SUPPORTED, scope.remote()
+                        ? "Table versioning is not supported by a Hoglake read session"
+                        : "Table versioning is not supported by dedicated Hoglake local read");
             }
             if (scope.remote() && !tableName.getSchemaName().equals(scope.teamSchema(reader.context()))) {
                 return null;
@@ -826,8 +860,13 @@ final class HoglakeDedicatedReadPath
             if (cached != null) {
                 return cached;
             }
-            Optional<HoglakeDtos.Table> found = reader.clientFor(session)
-                    .getTable(tableName.getSchemaName(), tableName.getTableName());
+            // The engine resolves a table without asking for its schema first. The server must
+            // answer the namespace itself as remote before any table of it is pinned.
+            if (scope.remote() && !schemaExists(session, tableName.getSchemaName())) {
+                return null;
+            }
+            Optional<HoglakeDtos.Table> found = discover(() -> reader.clientFor(session)
+                    .getTable(tableName.getSchemaName(), tableName.getTableName()));
             if (found.isEmpty()) {
                 return null;
             }
@@ -1052,8 +1091,23 @@ final class HoglakeDedicatedReadPath
                 Optional<String> schemaName,
                 UnaryOperator<Set<SchemaTableName>> relationFilter)
         {
-            reader(session, transaction);
-            throw listingDenied();
+            Reader reader = reader(session, transaction);
+            if (!scope.remote()) {
+                throw scope.listingDenied();
+            }
+            // The columns of the session's own team schema, each from the table's pinned handle
+            Set<SchemaTableName> tables = relationFilter.apply(ImmutableSet.copyOf(listTables(session, schemaName)));
+            ImmutableList.Builder<RelationColumnsMetadata> relations = ImmutableList.builder();
+            for (SchemaTableName name : tables) {
+                if (!name.getSchemaName().equals(scope.teamSchema(reader.context()))) {
+                    continue;
+                }
+                ConnectorTableHandle handle = getTableHandle(session, name, Optional.empty(), Optional.empty());
+                if (handle != null) {
+                    relations.add(RelationColumnsMetadata.forTable(name, getTableMetadata(session, handle).getColumns()));
+                }
+            }
+            return relations.build().iterator();
         }
 
         @Override
@@ -1063,7 +1117,11 @@ final class HoglakeDedicatedReadPath
                 UnaryOperator<Set<SchemaTableName>> relationFilter)
         {
             reader(session, transaction);
-            throw listingDenied();
+            if (scope.remote()) {
+                // No comment is read on this path
+                return ImmutableList.<RelationCommentMetadata>of().iterator();
+            }
+            throw scope.listingDenied();
         }
 
         @SuppressWarnings("deprecation")
@@ -1071,7 +1129,7 @@ final class HoglakeDedicatedReadPath
         public Map<SchemaTableName, List<ColumnMetadata>> listTableColumns(ConnectorSession session, SchemaTablePrefix prefix)
         {
             reader(session, transaction);
-            throw listingDenied();
+            throw scope.listingDenied();
         }
 
         @SuppressWarnings("deprecation")
@@ -1079,7 +1137,7 @@ final class HoglakeDedicatedReadPath
         public Iterator<TableColumnsMetadata> streamTableColumns(ConnectorSession session, SchemaTablePrefix prefix)
         {
             reader(session, transaction);
-            throw listingDenied();
+            throw scope.listingDenied();
         }
 
         @Override

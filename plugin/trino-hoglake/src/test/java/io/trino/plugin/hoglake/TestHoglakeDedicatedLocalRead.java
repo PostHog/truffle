@@ -300,6 +300,13 @@ final class TestHoglakeDedicatedLocalRead
                     .containsExactlyInAnyOrder("information_schema", "team_4");
             assertThat(runner.execute(session, "SHOW TABLES FROM hoglake.team_4").getOnlyColumnAsSet())
                     .containsExactly("events");
+            // The columns of its own tables are listed, from the pinned table.
+            assertThat(runner.execute(session, "DESCRIBE hoglake.team_4.events").getMaterializedRows())
+                    .extracting(row -> row.getField(0))
+                    .containsExactly("id", "label");
+            assertThat(runner.execute(session, "SELECT table_name, column_name FROM hoglake.information_schema.columns WHERE table_schema = 'team_4'").getMaterializedRows())
+                    .extracting(row -> List.of(row.getField(0), row.getField(1)))
+                    .containsExactlyInAnyOrder(List.of("events", "id"), List.of("events", "label"));
             for (String refused : List.of(
                     "SELECT * FROM hoglake.team_5.events",
                     "SELECT * FROM hoglake.reports.metrics",
@@ -396,6 +403,73 @@ final class TestHoglakeDedicatedLocalRead
                     .noneMatch(target -> target.contains("/scan"));
         }
         assertThat(fileSystems.reads()).isEmpty();
+    }
+
+    @Test
+    void testRemoteTeamSchemaRequiresARemoteNamespaceBeforeItResolvesATable()
+            throws Exception
+    {
+        KeyPair key = keyPair();
+        Path jwksFile = directory.resolve("remote-namespace-jwks.json");
+        writeJwks(jwksFile, key, KID);
+
+        CallerFixture alice = caller(key, "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSA", "SECRETA", "TOKENA");
+        byte[] parquetBytes = writeMetricsParquet(List.of(101L), List.of("alpha"));
+        String dataPath = "s3://example-remote/events/team_id=4/part-0.parquet";
+        String namespace = "/v1/catalogs/catalog-a/namespaces/team_4";
+        // The table and its scan answer as remote. Only the namespace differs: local, then missing.
+        for (Response namespaceAnswer : List.of(new Response(200, "{\"name\":\"team_4\",\"remote\":false}"), new Response(404, "{}"))) {
+            CredentialCheckingFileSystemFactory fileSystems = new CredentialCheckingFileSystemFactory(
+                    Map.of(alice.credentials(), Map.of(dataPath, parquetBytes)));
+            List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
+            try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> request.rawPathAndQuery().equals(namespace)
+                    ? namespaceAnswer
+                    : routeRemoteTable(request, "catalog-a", "team_4", "events", ALICE_TABLE_UUID, 5L, dataPath, parquetBytes.length, 1L, null));
+                    HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forRemoteTeamSchema(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), fileSystems, REMOTE_TARGETS);
+                    StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
+                for (String sql : List.of("SELECT id FROM hoglake.team_4.events", "SELECT count(*) FROM hoglake.team_4.events")) {
+                    assertThatThrownBy(() -> runner.execute(session, sql))
+                            .as("%s %s", namespaceAnswer.status(), sql)
+                            .isInstanceOf(QueryFailedException.class);
+                }
+                // Neither the table nor its scan is asked for.
+                assertThat(requests).extracting(RecordedRequest::rawPathAndQuery).containsOnly(namespace);
+            }
+            assertThat(fileSystems.reads()).isEmpty();
+        }
+    }
+
+    @Test
+    void testRemoteTeamSchemaDiscoveryFailuresNameNoRequestOrResponse()
+            throws Exception
+    {
+        KeyPair key = keyPair();
+        Path jwksFile = directory.resolve("remote-redacted-jwks.json");
+        writeJwks(jwksFile, key, KID);
+
+        CallerFixture alice = caller(key, "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSA", "SECRETA", "TOKENA");
+        String namespace = "/v1/catalogs/catalog-a/namespaces/team_4";
+        for (String failing : List.of(namespace, namespace + "/tables", namespace + "/tables/events")) {
+            List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
+            try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> request.rawPathAndQuery().equals(failing)
+                    ? new Response(500, "{\"error\":\"sensitive-response-body\"}")
+                    : routeRemoteTable(request, "catalog-a", "team_4", "events", ALICE_TABLE_UUID, 5L, null, 0, 1L, null));
+                    HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forRemoteTeamSchema(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), new CredentialCheckingFileSystemFactory(Map.of()), REMOTE_TARGETS);
+                    StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
+                String sql = failing.endsWith("/tables") ? "SHOW TABLES FROM hoglake.team_4" : "SELECT id FROM hoglake.team_4.events";
+                assertThatThrownBy(() -> runner.execute(session, sql))
+                        .as(failing)
+                        .isInstanceOf(QueryFailedException.class)
+                        .hasMessageEndingWith("Hoglake read session metadata request failed")
+                        .satisfies(failure -> {
+                            StringWriter trace = new StringWriter();
+                            failure.printStackTrace(new PrintWriter(trace));
+                            assertThat(trace.toString()).doesNotContain("sensitive-response-body", "catalog-a", "127.0.0.1", alice.jwt());
+                        });
+            }
+        }
     }
 
     @Test

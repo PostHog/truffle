@@ -222,6 +222,11 @@ A read sends only these GET routes, each with the caller's exact verified JWT:
 No route carries any other query.
 The local-only routes are never used on this path.
 
+The namespace must answer as `remote` before the connector asks for any table of it.
+`DESCRIBE` and `information_schema.columns` list the columns of the team schema's tables, each from the table's pinned answer.
+When the namespace, table list, or table request fails, the query fails with the same error code and a fixed message that names no request and no response body.
+The `16MiB` metadata response ceiling does not apply to these requests.
+
 Every data file and deletion vector of a scan must be inside a grant of one of the two remote targets.
 The coordinator checks every path before it emits a split, and refuses the whole scan when one is outside.
 Each worker checks the paths of its split again, and the file system checks every file it opens.
