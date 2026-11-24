@@ -120,6 +120,22 @@ public class HoglakeClient
     // How often a request that is safe to repeat is sent again after a 429 or 503
     private static final int BUSY_RETRIES = 3;
 
+    /**
+     * The path prefix of Hoglake's local-only read routes. On these routes Hoglake reads
+     * only its own bound local namespace, table, or pinned scan and never relays to a
+     * remote schema. A server that predates the routes has no route under this prefix,
+     * so it cannot match the request to an ordinary, federated route.
+     */
+    public static final String LOCAL_ONLY_PREFIX = "/v1/local-only";
+
+    /**
+     * The response marker of the local-only routes. Hoglake sends it on each answer to a
+     * well-formed local-only request. A server that predates the routes does not, so a
+     * local-only client refuses every answer without it, a 404 included.
+     */
+    public static final String LOCAL_ONLY_MARKER = "X-Hoglake-Local-Only";
+    private static final String LOCAL_ONLY_MARKER_VALUE = "true";
+
     private final HttpClient httpClient;
     private final HoglakeTokenSource tokenSource;
     private final ObjectMapper mapper;
@@ -130,6 +146,7 @@ public class HoglakeClient
     private final ScanIncludeSupport columnStatsSupport;
     private final ScanIncludeSupport splitOffsetsSupport;
     private final RouteGuard routeGuard;
+    private final boolean localOnly;
     private final boolean ownsHttpClient;
     private final Optional<String> queryId;
 
@@ -170,6 +187,7 @@ public class HoglakeClient
                 .build();
         this.ownsHttpClient = true;
         this.routeGuard = RouteGuard.ALLOW_ALL;
+        this.localOnly = false;
         this.queryId = Optional.empty();
         this.mapper = new ObjectMapper()
                 .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
@@ -182,6 +200,16 @@ public class HoglakeClient
      */
     public HoglakeClient(String baseUri, String catalog, Duration requestTimeout, HoglakeTokenSource tokenSource, HttpClient httpClient, RouteGuard routeGuard)
     {
+        this(baseUri, catalog, requestTimeout, tokenSource, httpClient, routeGuard, false);
+    }
+
+    /**
+     * A per-caller client as above. With {@code localOnly}, every catalog request goes to
+     * Hoglake's local-only routes ({@value #LOCAL_ONLY_PREFIX}), never to an ordinary route,
+     * and every answer must carry {@value #LOCAL_ONLY_MARKER} or the request fails.
+     */
+    public HoglakeClient(String baseUri, String catalog, Duration requestTimeout, HoglakeTokenSource tokenSource, HttpClient httpClient, RouteGuard routeGuard, boolean localOnly)
+    {
         this.columnStatsSupport = new ScanIncludeSupport(COLUMN_STATS);
         this.splitOffsetsSupport = new ScanIncludeSupport(SPLIT_OFFSETS);
         this.baseUri = validateBaseUri(requireNonNull(baseUri, "baseUri is null")).toString();
@@ -192,6 +220,7 @@ public class HoglakeClient
         this.httpClient = requireNonNull(httpClient, "httpClient is null");
         this.ownsHttpClient = false;
         this.routeGuard = requireNonNull(routeGuard, "routeGuard is null");
+        this.localOnly = localOnly;
         this.queryId = Optional.empty();
         this.mapper = new ObjectMapper()
                 .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
@@ -209,6 +238,7 @@ public class HoglakeClient
         this.httpClient = client.httpClient;
         this.ownsHttpClient = false;
         this.routeGuard = client.routeGuard;
+        this.localOnly = client.localOnly;
         this.queryId = Optional.of(requireNonNull(queryId, "queryId is null"));
         this.mapper = client.mapper;
     }
@@ -1028,13 +1058,26 @@ public class HoglakeClient
         routeGuard.check(request.method(), request.uri());
         long deadline = System.nanoTime() + request.timeout().orElseThrow().toNanos();
         Optional<String> token = tokenSource.token(remaining(deadline));
-        HttpResponse<String> response = sendOnce(authorized(request, token, remaining(deadline)));
+        HttpResponse<String> response = confirmLocalOnly(sendOnce(authorized(request, token, remaining(deadline))));
         if (response.statusCode() != 401 || token.isEmpty()) {
             return response;
         }
         tokenSource.invalidate(token.get());
         Optional<String> replacement = tokenSource.token(remaining(deadline));
-        return sendOnce(authorized(request, replacement, remaining(deadline)));
+        return confirmLocalOnly(sendOnce(authorized(request, replacement, remaining(deadline))));
+    }
+
+    /**
+     * In local-only mode, refuses every answer without the marker, before any status is
+     * read. A server that predates the local-only routes, or a proxy in front of it,
+     * answers them without the marker. Its 404 is not absence.
+     */
+    private HttpResponse<String> confirmLocalOnly(HttpResponse<String> response)
+    {
+        if (localOnly && !response.headers().allValues(LOCAL_ONLY_MARKER).equals(List.of(LOCAL_ONLY_MARKER_VALUE))) {
+            throw new TrinoException(HOGLAKE_INVALID_RESPONSE, "Hoglake did not confirm the local-only read mode");
+        }
+        return response;
     }
 
     /**
@@ -1205,7 +1248,9 @@ public class HoglakeClient
 
     private String catalogPath(String suffix)
     {
-        return "/v1/catalogs/" + encode(catalog) + suffix;
+        // A local-only client never builds an ordinary route, so a fallback to federation cannot exist.
+        String prefix = localOnly ? LOCAL_ONLY_PREFIX : "/v1";
+        return prefix + "/catalogs/" + encode(catalog) + suffix;
     }
 
     private String namespacePath(String namespace, String suffix)

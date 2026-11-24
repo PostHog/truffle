@@ -30,6 +30,7 @@ import io.trino.filesystem.TrinoOutputFile;
 import io.trino.filesystem.memory.MemoryInputFile;
 import io.trino.parquet.writer.ParquetWriterOptions;
 import io.trino.plugin.hoglake.rest.HoglakeClient;
+import io.trino.plugin.hoglake.rest.HoglakeTokenSource;
 import io.trino.plugin.hoglake.testing.ConnectorTestFixtures;
 import io.trino.plugin.hoglake.testing.ConnectorTestFixtures.FileColumn;
 import io.trino.plugin.hoglake.testing.PuffinDeletionVectorFixtures;
@@ -71,6 +72,7 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.InetSocketAddress;
 import java.net.URI;
+import java.net.http.HttpClient;
 import java.nio.file.Path;
 import java.security.KeyPair;
 import java.time.Clock;
@@ -98,6 +100,7 @@ import static io.trino.connector.CatalogHandle.createRootCatalogHandle;
 import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_ACCESS_KEY_PROPERTY;
 import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_SECRET_KEY_PROPERTY;
 import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_SESSION_TOKEN_PROPERTY;
+import static io.trino.plugin.hoglake.HoglakeErrorCode.HOGLAKE_INVALID_RESPONSE;
 import static io.trino.plugin.hoglake.HoglakeReadSessionVerifier.DEFAULT_PROFILE;
 import static io.trino.plugin.hoglake.HoglakeReadSessionVerifier.SESSION_TOKEN;
 import static io.trino.plugin.hoglake.HoglakeSharedSessionTestSupport.BACKEND_ID;
@@ -170,29 +173,35 @@ final class TestHoglakeDedicatedLocalRead
     {
         HoglakeClient.RouteGuard guard = HoglakeDedicatedReadPath.createRouteGuard("", "catalog-a");
 
-        guard.check("GET", URI.create("http://metadata.example.test/v1/catalogs/catalog-a/namespaces/reports"));
-        guard.check("GET", URI.create("http://metadata.example.test/v1/catalogs/catalog-a/namespaces/reports/tables/metrics"));
-        guard.check("GET", URI.create("http://metadata.example.test/v1/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?snapshot=0&table_uuid=" + ALICE_TABLE_UUID));
-        guard.check("GET", URI.create("http://metadata.example.test/v1/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?table_uuid=" + ALICE_TABLE_UUID + "&snapshot=42"));
+        guard.check("GET", URI.create("http://metadata.example.test/v1/local-only/catalogs/catalog-a/namespaces/reports"));
+        guard.check("GET", URI.create("http://metadata.example.test/v1/local-only/catalogs/catalog-a/namespaces/reports/tables/metrics"));
+        guard.check("GET", URI.create("http://metadata.example.test/v1/local-only/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?snapshot=0&table_uuid=" + ALICE_TABLE_UUID));
+        guard.check("GET", URI.create("http://metadata.example.test/v1/local-only/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?table_uuid=" + ALICE_TABLE_UUID + "&snapshot=42"));
 
+        String local = "/v1/local-only/catalogs/catalog-a";
         List<String> disallowedPaths = List.of(
-                "/v1/catalogs/catalog-a",
-                "/v1/catalogs/catalog-a/namespaces",
-                "/v1/catalogs/catalog-a/namespaces/reports/tables",
-                "/v1/catalogs/catalog-b/namespaces/reports",
-                "/v1/catalogs/catalog-a/namespaces/reports?x=1",
-                "/v1/catalogs/catalog-a/namespaces/reports/tables/metrics?snapshot=5",
-                "/v1/catalogs/catalog-a/namespaces/reports/tables/metrics/scan",
-                "/v1/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?snapshot=5",
-                "/v1/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?table_uuid=" + ALICE_TABLE_UUID,
-                "/v1/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?snapshot=-1&table_uuid=" + ALICE_TABLE_UUID,
-                "/v1/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?snapshot=05&table_uuid=" + ALICE_TABLE_UUID,
-                "/v1/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID.toUpperCase(ENGLISH),
-                "/v1/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?snapshot=5&table_uuid=not-a-uuid",
-                "/v1/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID + "&extra=1",
-                "/v1/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?snapshot=5&snapshot=6&table_uuid=" + ALICE_TABLE_UUID,
-                "/v1/catalogs/catalog-a/namespaces/..%2fother/tables/metrics",
-                "/v1/catalogs/catalog-a/namespaces/reports/tables/metrics#fragment");
+                // The ordinary routes, which a remote schema can relay, are never sent.
+                "/v1/catalogs/catalog-a/namespaces/reports",
+                "/v1/catalogs/catalog-a/namespaces/reports/tables/metrics",
+                "/v1/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID,
+                "/v1/local-only/catalogs/catalog-b/namespaces/reports",
+                "/v1/local-only/namespaces/reports",
+                local,
+                local + "/namespaces",
+                local + "/namespaces/reports/tables",
+                local + "/namespaces/reports?x=1",
+                local + "/namespaces/reports/tables/metrics?snapshot=5",
+                local + "/namespaces/reports/tables/metrics/scan",
+                local + "/namespaces/reports/tables/metrics/scan?snapshot=5",
+                local + "/namespaces/reports/tables/metrics/scan?table_uuid=" + ALICE_TABLE_UUID,
+                local + "/namespaces/reports/tables/metrics/scan?snapshot=-1&table_uuid=" + ALICE_TABLE_UUID,
+                local + "/namespaces/reports/tables/metrics/scan?snapshot=05&table_uuid=" + ALICE_TABLE_UUID,
+                local + "/namespaces/reports/tables/metrics/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID.toUpperCase(ENGLISH),
+                local + "/namespaces/reports/tables/metrics/scan?snapshot=5&table_uuid=not-a-uuid",
+                local + "/namespaces/reports/tables/metrics/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID + "&extra=1",
+                local + "/namespaces/reports/tables/metrics/scan?snapshot=5&snapshot=6&table_uuid=" + ALICE_TABLE_UUID,
+                local + "/namespaces/..%2fother/tables/metrics",
+                local + "/namespaces/reports/tables/metrics#fragment");
 
         for (String path : disallowedPaths) {
             assertRedactedDenial(
@@ -203,7 +212,7 @@ final class TestHoglakeDedicatedLocalRead
 
         for (String method : List.of("POST", "PUT", "DELETE", "PATCH")) {
             assertRedactedDenial(
-                    () -> guard.check(method, URI.create("http://metadata.example.test/v1/catalogs/catalog-a/namespaces/reports")),
+                    () -> guard.check(method, URI.create("http://metadata.example.test/v1/local-only/catalogs/catalog-a/namespaces/reports")),
                     REQUEST_DENIED,
                     "catalog-a");
         }
@@ -272,11 +281,12 @@ final class TestHoglakeDedicatedLocalRead
                 readPath.end(transaction);
             }
 
-            // Confirm that every read HTTP request forwards Alice's exact JWT on allowed GET routes.
+            // Confirm that every read HTTP request forwards Alice's exact JWT on allowed GET routes in local-only mode.
             assertThat(requests).isNotEmpty();
             assertThat(requests).allSatisfy(request -> {
                 assertThat(request.method()).isEqualTo("GET");
                 assertThat(request.authorization()).isEqualTo("Bearer " + alice.jwt());
+                assertThat(request.isLocalOnly()).isTrue();
                 assertThat(request.rawPathAndQuery()).isIn(
                         "/v1/catalogs/catalog-a/namespaces/reports",
                         "/v1/catalogs/catalog-a/namespaces/missing",
@@ -905,6 +915,213 @@ final class TestHoglakeDedicatedLocalRead
     }
 
     @Test
+    void testLocalNamespaceWinsTeamRelayCollisionForMetadataAndPinnedRead()
+            throws Exception
+    {
+        KeyPair key = keyPair();
+        Path jwksFile = directory.resolve("collision-jwks.json");
+        writeJwks(jwksFile, key, KID);
+
+        CallerFixture alice = caller(key, "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSA", "SECRETA", "TOKENA");
+        byte[] parquetBytes = writeMetricsParquet(List.of(101L, 202L), List.of("alpha", "beta"));
+        String dataPath = alice.tableFile("metrics/part-0.parquet");
+        CredentialCheckingFileSystemFactory fileSystems = new CredentialCheckingFileSystemFactory(
+                Map.of(alice.credentials(), Map.of(dataPath, parquetBytes)));
+
+        List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
+        List<RecordedRequest> relayed = new CopyOnWriteArrayList<>();
+        try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> routeCustomerHoglake(
+                request,
+                relayed,
+                alice.catalog(),
+                dataPath,
+                parquetBytes.length));
+                HoglakeDedicatedReadPath readPath = new HoglakeDedicatedReadPath(
+                        server.baseUri(),
+                        Duration.ofSeconds(10),
+                        verifier(jwksFile),
+                        fileSystems);
+                StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+            Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
+
+            // The local namespace with the relayed team name answers the metadata lookup and the pinned scan.
+            MaterializedResult rows = runner.execute(session, "SELECT id, label FROM hoglake.team_4.metrics ORDER BY id");
+            assertThat(rows.getMaterializedRows())
+                    .extracting(row -> List.of(row.getField(0), row.getField(1)))
+                    .containsExactly(List.of(101L, "alpha"), List.of(202L, "beta"));
+
+            ConnectorTransactionHandle transaction = new HoglakeTransactionHandle(UUID.randomUUID());
+            ConnectorSession connectorSession = session.toConnectorSession(CATALOG_HANDLE);
+            try {
+                assertThat(readPath.metadata(connectorSession, transaction).schemaExists(connectorSession, "team_4")).isTrue();
+            }
+            finally {
+                readPath.end(transaction);
+            }
+
+            assertThat(relayed).isEmpty();
+            assertThat(requests).extracting(RecordedRequest::rawPathAndQuery)
+                    .contains(
+                            "/v1/catalogs/catalog-a/namespaces/team_4/tables/metrics",
+                            "/v1/catalogs/catalog-a/namespaces/team_4/tables/metrics/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID);
+            assertThat(requests).allSatisfy(request -> assertThat(request.isLocalOnly()).isTrue());
+            assertThat(requests).extracting(RecordedRequest::wirePathAndQuery)
+                    .contains(
+                            "/v1/local-only/catalogs/catalog-a/namespaces/team_4/tables/metrics",
+                            "/v1/local-only/catalogs/catalog-a/namespaces/team_4/tables/metrics/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID);
+
+            // The same service still relays the name on the ordinary route, as the shared catalog sends it.
+            try (HttpClient http = HttpClient.newHttpClient();
+                    HoglakeClient shared = new HoglakeClient(
+                            server.baseUri().toASCIIString(),
+                            alice.catalog(),
+                            Duration.ofSeconds(10),
+                            new HoglakeTokenSource.Fixed(alice.jwt()),
+                            http,
+                            HoglakeClient.RouteGuard.ALLOW_ALL)) {
+                assertThat(shared.findNamespace("team_4")).hasValueSatisfying(namespace -> assertThat(namespace.isRemote()).isTrue());
+            }
+            assertThat(relayed).hasSize(1);
+            assertThat(relayed.getFirst().isLocalOnly()).isFalse();
+            assertThat(relayed.getFirst().wirePathAndQuery()).isEqualTo("/v1/catalogs/catalog-a/namespaces/team_4");
+        }
+
+        assertThat(fileSystems.reads()).isNotEmpty().allSatisfy(read -> {
+            assertThat(read.credentials()).isEqualTo(alice.credentials());
+            assertThat(read.location()).isEqualTo(dataPath);
+        });
+    }
+
+    @Test
+    void testAbsentLocalNamesAreOrdinaryAbsenceWithoutRelay()
+            throws Exception
+    {
+        KeyPair key = keyPair();
+        Path jwksFile = directory.resolve("absence-jwks.json");
+        writeJwks(jwksFile, key, KID);
+
+        CallerFixture alice = caller(key, "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSA", "SECRETA", "TOKENA");
+        String dataPath = alice.tableFile("metrics/part-0.parquet");
+        TrinoFileSystemFactory noStorage = _ -> {
+            throw new AssertionError("An absent table must not open storage");
+        };
+
+        List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
+        List<RecordedRequest> relayed = new CopyOnWriteArrayList<>();
+        try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> routeCustomerHoglake(request, relayed, alice.catalog(), dataPath, 128L));
+                HoglakeDedicatedReadPath readPath = new HoglakeDedicatedReadPath(
+                        server.baseUri(),
+                        Duration.ofSeconds(10),
+                        verifier(jwksFile),
+                        noStorage);
+                StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+            Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
+            ConnectorSession connectorSession = session.toConnectorSession(CATALOG_HANDLE);
+
+            ConnectorTransactionHandle transaction = new HoglakeTransactionHandle(UUID.randomUUID());
+            try {
+                ConnectorMetadata metadata = readPath.metadata(connectorSession, transaction);
+                // A relayed team name with no local namespace, and an ordinary missing name.
+                assertThat(metadata.schemaExists(connectorSession, "team_7")).isFalse();
+                assertThat(metadata.schemaExists(connectorSession, "reports")).isFalse();
+                assertThat(metadata.getTableHandle(connectorSession, new SchemaTableName("team_7", "events"), Optional.empty(), Optional.empty())).isNull();
+                assertThat(metadata.getTableHandle(connectorSession, new SchemaTableName("team_4", "missing"), Optional.empty(), Optional.empty())).isNull();
+            }
+            finally {
+                readPath.end(transaction);
+            }
+
+            assertThatThrownBy(() -> runner.execute(session, "SELECT * FROM hoglake.team_7.events"))
+                    .isInstanceOf(QueryFailedException.class)
+                    .hasMessageContaining("does not exist");
+
+            assertThat(requests).isNotEmpty().allSatisfy(request -> assertThat(request.isLocalOnly()).isTrue());
+            assertThat(relayed).isEmpty();
+        }
+    }
+
+    @Test
+    void testUnconfirmedAnswersFailClosedDuringVersionSkew()
+            throws Exception
+    {
+        KeyPair key = keyPair();
+        Path jwksFile = directory.resolve("skew-jwks.json");
+        writeJwks(jwksFile, key, KID);
+
+        CallerFixture alice = caller(key, "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSA", "SECRETA", "TOKENA");
+        String dataPath = alice.tableFile("metrics/part-0.parquet");
+        TrinoFileSystemFactory noStorage = _ -> {
+            throw new AssertionError("An unconfirmed answer must not open storage");
+        };
+
+        // A Hoglake that predates the local-only routes, or a proxy in front of it: an unknown-path 404,
+        // a 401, or a busy answer, never with the marker. None is absence, and nothing is retried or relayed.
+        for (Response oldAnswer : List.of(new Response(404, "{}"), new Response(401, "{}"), new Response(503, "{}"))) {
+            List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
+            try (DedicatedTestServer server = DedicatedTestServer.start(
+                    requests,
+                    request -> routeLocalTable(request, alice.catalog(), "reports", "metrics", ALICE_TABLE_UUID, 5L, dataPath, 128L, 1L, null),
+                    Optional.of(oldAnswer));
+                    HoglakeDedicatedReadPath readPath = new HoglakeDedicatedReadPath(
+                            server.baseUri(),
+                            Duration.ofSeconds(10),
+                            verifier(jwksFile),
+                            noStorage)) {
+                ConnectorSession session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "reports").toConnectorSession(CATALOG_HANDLE);
+                ConnectorTransactionHandle transaction = new HoglakeTransactionHandle(UUID.randomUUID());
+                try {
+                    ConnectorMetadata metadata = readPath.metadata(session, transaction);
+                    List<Runnable> lookups = List.of(
+                            () -> metadata.schemaExists(session, "reports"),
+                            () -> metadata.schemaExists(session, "missing"),
+                            () -> metadata.getTableHandle(session, new SchemaTableName("reports", "metrics"), Optional.empty(), Optional.empty()),
+                            () -> metadata.getTableHandle(session, new SchemaTableName("reports", "missing"), Optional.empty(), Optional.empty()),
+                            () -> readPath.splitManager().getSplits(transaction, session, localHandle("reports", "metrics", 5L, ALICE_TABLE_UUID), Set.of(), Constraint.alwaysTrue()));
+                    for (Runnable lookup : lookups) {
+                        assertThatThrownBy(lookup::run)
+                                .isInstanceOfSatisfying(TrinoException.class, failure -> {
+                                    assertThat(failure.getErrorCode()).isEqualTo(HOGLAKE_INVALID_RESPONSE.toErrorCode());
+                                    assertThat(failure.getMessage()).isEqualTo("Hoglake did not confirm the local-only read mode");
+                                });
+                    }
+                }
+                finally {
+                    readPath.end(transaction);
+                }
+            }
+
+            assertThat(requests).describedAs("old server answer %s", oldAnswer.status())
+                    .hasSize(5)
+                    .allSatisfy(request -> {
+                        assertThat(request.isLocalOnly()).isTrue();
+                        assertThat(request.wirePathAndQuery()).startsWith("/v1/local-only/catalogs/catalog-a/namespaces/");
+                    });
+        }
+    }
+
+    /**
+     * Models one Customer Hoglake that serves both Trino catalogs. A configured remote schema relays every
+     * canonical team namespace on the ordinary routes. On the local-only routes, only the local warehouse
+     * answers: here, the local namespace {@code team_4} with the table {@code metrics}.
+     */
+    private static Response routeCustomerHoglake(RecordedRequest request, List<RecordedRequest> relayed, String catalog, String dataPath, long fileSizeBytes)
+    {
+        String teamPrefix = "/v1/catalogs/" + catalog + "/namespaces/team_";
+        if (!request.isLocalOnly()) {
+            if (!request.rawPath().startsWith(teamPrefix)) {
+                return new Response(404, "{}");
+            }
+            relayed.add(request);
+            String namespace = request.rawPath().substring(("/v1/catalogs/" + catalog + "/namespaces/").length()).split("/", -1)[0];
+            return new Response(200,
+                    """
+                    {"name":"%s","remote":true}
+                    """.formatted(namespace));
+        }
+        return routeLocalTable(request, catalog, "team_4", "metrics", ALICE_TABLE_UUID, 5L, dataPath, fileSizeBytes, 2L, null);
+    }
+
+    @Test
     void testConnectorFactoryDedicatedLocalReadIsDefaultOffAndIsolated()
             throws Exception
     {
@@ -1391,7 +1608,12 @@ final class TestHoglakeDedicatedLocalRead
         }
     }
 
-    private record RecordedRequest(String method, String rawPath, String rawPathAndQuery, String authorization, String securityToken, String range) {}
+    /**
+     * One request to the fake service. For a request on a local-only route, {@code rawPath} and
+     * {@code rawPathAndQuery} are the ordinary route that it names, so one handler serves both.
+     * {@code wirePathAndQuery} is the target as sent.
+     */
+    private record RecordedRequest(String method, String rawPath, String rawPathAndQuery, String authorization, String securityToken, String range, boolean isLocalOnly, String wirePathAndQuery) {}
 
     private record Response(int status, String contentType, byte[] body, Map<String, String> headers)
     {
@@ -1462,11 +1684,25 @@ final class TestHoglakeDedicatedLocalRead
             this.server = server;
         }
 
+        /**
+         * A server that serves the local-only routes with the marker on each answer, as Hoglake does.
+         */
         static DedicatedTestServer start(List<RecordedRequest> recorded, Function<RecordedRequest, Response> handler)
                 throws IOException
         {
+            return start(recorded, handler, Optional.empty());
+        }
+
+        /**
+         * With {@code oldServer} present, the server models a Hoglake that predates the local-only routes.
+         * It has no route under the prefix, so it answers each local-only request with that fixed answer and
+         * without the marker. The handler never sees such a request.
+         */
+        static DedicatedTestServer start(List<RecordedRequest> recorded, Function<RecordedRequest, Response> handler, Optional<Response> oldServer)
+                throws IOException
+        {
             HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-            server.createContext("/", exchange -> handle(exchange, recorded, handler));
+            server.createContext("/", exchange -> handle(exchange, recorded, handler, oldServer));
             server.start();
             return new DedicatedTestServer(server);
         }
@@ -1482,23 +1718,40 @@ final class TestHoglakeDedicatedLocalRead
             server.stop(0);
         }
 
-        private static void handle(HttpExchange exchange, List<RecordedRequest> recorded, Function<RecordedRequest, Response> handler)
+        private static void handle(HttpExchange exchange, List<RecordedRequest> recorded, Function<RecordedRequest, Response> handler, Optional<Response> oldServer)
                 throws IOException
         {
             URI uri = exchange.getRequestURI();
-            String rawPath = uri.getRawPath();
+            String wirePath = uri.getRawPath();
             String rawQuery = uri.getRawQuery();
-            String rawPathAndQuery = rawQuery == null ? rawPath : rawPath + "?" + rawQuery;
+            String localOnlyCatalogs = HoglakeClient.LOCAL_ONLY_PREFIX + "/catalogs/";
+            boolean localOnly = wirePath.startsWith(localOnlyCatalogs);
+            String rawPath = wirePath;
+            if (localOnly) {
+                rawPath = "/v1/catalogs/" + wirePath.substring(localOnlyCatalogs.length());
+            }
+            String query = rawQuery == null ? "" : "?" + rawQuery;
             RecordedRequest request = new RecordedRequest(
                     exchange.getRequestMethod(),
                     rawPath,
-                    rawPathAndQuery,
+                    rawPath + query,
                     exchange.getRequestHeaders().getFirst("Authorization"),
                     exchange.getRequestHeaders().getFirst("X-Amz-Security-Token"),
-                    exchange.getRequestHeaders().getFirst("Range"));
+                    exchange.getRequestHeaders().getFirst("Range"),
+                    localOnly,
+                    wirePath + query);
             recorded.add(request);
-            Response response = handler.apply(request);
+            Response response;
+            if (localOnly && oldServer.isPresent()) {
+                response = oldServer.get();
+            }
+            else {
+                response = handler.apply(request);
+            }
             exchange.getResponseHeaders().set("Content-Type", response.contentType());
+            if (localOnly && oldServer.isEmpty()) {
+                exchange.getResponseHeaders().set(HoglakeClient.LOCAL_ONLY_MARKER, "true");
+            }
             response.headers().forEach((name, value) -> exchange.getResponseHeaders().set(name, value));
             if (exchange.getRequestMethod().equals("HEAD") || response.body() == null) {
                 exchange.sendResponseHeaders(response.status(), -1);
