@@ -21,6 +21,7 @@ import com.sun.net.httpserver.HttpServer;
 import io.airlift.slice.Slices;
 import io.trino.Session;
 import io.trino.connector.CatalogHandle;
+import io.trino.execution.Failure;
 import io.trino.filesystem.FileIterator;
 import io.trino.filesystem.Location;
 import io.trino.filesystem.TrinoFileSystem;
@@ -100,6 +101,7 @@ import static io.trino.connector.CatalogHandle.createRootCatalogHandle;
 import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_ACCESS_KEY_PROPERTY;
 import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_SECRET_KEY_PROPERTY;
 import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_SESSION_TOKEN_PROPERTY;
+import static io.trino.plugin.hoglake.HoglakeErrorCode.HOGLAKE_CATALOG_UNAVAILABLE;
 import static io.trino.plugin.hoglake.HoglakeErrorCode.HOGLAKE_INVALID_RESPONSE;
 import static io.trino.plugin.hoglake.HoglakeReadSessionVerifier.DEFAULT_PROFILE;
 import static io.trino.plugin.hoglake.HoglakeReadSessionVerifier.SESSION_TOKEN;
@@ -450,7 +452,8 @@ final class TestHoglakeDedicatedLocalRead
 
         CallerFixture alice = caller(key, "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSA", "SECRETA", "TOKENA");
         String namespace = "/v1/catalogs/catalog-a/namespaces/team_4";
-        for (String failing : List.of(namespace, namespace + "/tables", namespace + "/tables/events")) {
+        String scan = namespace + "/tables/events/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID;
+        for (String failing : List.of(namespace, namespace + "/tables", namespace + "/tables/events", scan)) {
             List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
             try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> request.rawPathAndQuery().equals(failing)
                     ? new Response(500, "{\"error\":\"sensitive-response-body\"}")
@@ -464,6 +467,9 @@ final class TestHoglakeDedicatedLocalRead
                         .isInstanceOf(QueryFailedException.class)
                         .hasMessageEndingWith("Hoglake read session metadata request failed")
                         .satisfies(failure -> {
+                            // Redaction keeps the client's error code.
+                            assertThat(failure.getCause()).as(failing).isInstanceOfSatisfying(Failure.class, cause ->
+                                    assertThat(cause.getFailureInfo().errorCode()).isEqualTo(HOGLAKE_CATALOG_UNAVAILABLE.toErrorCode()));
                             StringWriter trace = new StringWriter();
                             failure.printStackTrace(new PrintWriter(trace));
                             assertThat(trace.toString()).doesNotContain("sensitive-response-body", "catalog-a", "127.0.0.1", alice.jwt());

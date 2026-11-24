@@ -224,7 +224,7 @@ The local-only routes are never used on this path.
 
 The namespace must answer as `remote` before the connector asks for any table of it.
 `DESCRIBE` and `information_schema.columns` list the columns of the team schema's tables, each from the table's pinned answer.
-When the namespace, table list, or table request fails, the query fails with the same error code and a fixed message that names no request and no response body.
+When the namespace, table list, table, or scan request fails, the query fails with the same error code and a fixed message that names no request and no response body.
 The `16MiB` metadata response ceiling does not apply to these requests.
 
 Every data file and deletion vector of a scan must be inside a grant of one of the two remote targets.
