@@ -355,6 +355,11 @@ public final class HoglakeSharedConnector
         @Override
         public boolean schemaExists(ConnectorSession session, String schemaName)
         {
+            // A team schema the token does not hold does not exist for this caller: no
+            // request is sent for it, whatever the existence-check setting
+            if (readPath.isPresent() && verifier.verify(session).isTeamSchemaOutsideGrant(schemaName)) {
+                return false;
+            }
             return client.namespaceExists(session, schemaName);
         }
 
@@ -392,8 +397,9 @@ public final class HoglakeSharedConnector
             HoglakeSharedSessionContext context = verifier.verify(session);
             if (!context.readsTeamSchema(tableName.getSchemaName())) {
                 // A team schema the token does not hold answers as one that does not
-                // exist, with no request for it: "not yours" and "no such team" are
-                // the same answer, so team ids cannot be probed
+                // exist: "not yours" and "no such team" are the same answer, so team ids
+                // cannot be probed. No request is sent for it here or in schemaExists,
+                // whatever the existence-check setting.
                 if (startVersion.isEmpty() && endVersion.isEmpty() && context.isTeamSchemaOutsideGrant(tableName.getSchemaName())) {
                     return null;
                 }
