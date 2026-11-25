@@ -99,6 +99,7 @@ import java.util.function.UnaryOperator;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
+import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 
 /**
@@ -396,21 +397,37 @@ public final class HoglakeSharedConnector
         @Override
         public boolean schemaExists(ConnectorSession session, String schemaName)
         {
+            // A team schema the token does not hold does not exist for this caller: no
+            // request is sent for it, whatever the existence-check setting or profile
+            if (verifier.verify(session).holdsNoTeamSchema(schemaName)) {
+                return false;
+            }
             return client.namespaceExists(session, schemaName);
         }
 
         @Override
         public List<String> listSchemaNames(ConnectorSession session)
         {
+            HoglakeSharedSessionContext context = verifier.verify(session);
+            // The server lists only the token's teams; a team the token does not hold is
+            // dropped here too, should it ever be listed, in any case. A name that is not
+            // lowercase is dropped as well: a Trino schema name is lowercase, so the
+            // engine could only address it by another name. Listing tables with no schema
+            // given uses this list, so nothing is asked for a dropped name.
             return client.listNamespaces(session).stream()
                     .map(HoglakeDtos.Namespace::name)
+                    .filter(name -> name.equals(name.toLowerCase(ENGLISH)) && !context.holdsNoTeamSchema(name))
                     .collect(toImmutableList());
         }
 
         @Override
         public List<SchemaTableName> listTables(ConnectorSession session, Optional<String> schemaName)
         {
-            verifier.verify(session);
+            HoglakeSharedSessionContext context = verifier.verify(session);
+            if (schemaName.isPresent() && context.holdsNoTeamSchema(schemaName.get())) {
+                // As a schema that does not exist, with no request for it
+                return List.of();
+            }
             List<String> schemas = schemaName.map(List::of).orElseGet(() -> listSchemaNames(session));
             return schemas.stream()
                     .flatMap(schema -> client.listTables(session, schema).stream()
@@ -427,10 +444,35 @@ public final class HoglakeSharedConnector
         {
             // Decided from the verified token alone, before any request: only a team
             // schema the token holds is looked up at all
-            if (readPath.isEmpty() || !verifier.verify(session).readsTeamSchema(tableName.getSchemaName())) {
+            if (readPath.isEmpty()) {
                 throw denyExecution(session);
             }
-            ConnectorTableHandle handle = readPath.get().reader(session, transaction).metadata().getTableHandle(session, tableName, startVersion, endVersion);
+            HoglakeSharedSessionContext context = verifier.verify(session);
+            if (!context.readsTeamSchema(tableName.getSchemaName())) {
+                // A team schema the token does not hold answers as one that does not
+                // exist, time travel included: "not yours" and "no such team" are the
+                // same answer, so team ids cannot be probed. No request is ever sent for
+                // it, here or on any other path, whatever the existence-check setting.
+                if (context.isTeamSchemaOutsideGrant(tableName.getSchemaName())) {
+                    return null;
+                }
+                throw denyExecution(session);
+            }
+            HoglakeMetadata metadata = readPath.get().reader(session, transaction).metadata();
+            // Time travel is refused by the metadata before any request
+            if (startVersion.isEmpty() && endVersion.isEmpty()) {
+                // A team schema the server does not have (404) is a missing schema, not
+                // a local one: no table or snapshot of this catalog is asked for
+                if (!metadata.hasNamespace(tableName.getSchemaName())) {
+                    return null;
+                }
+                // A namespace the server does not call remote is refused before anything
+                // else is asked: the name never makes a schema remote
+                if (!metadata.isRemoteSchema(tableName.getSchemaName())) {
+                    throw denyExecution(session);
+                }
+            }
+            ConnectorTableHandle handle = metadata.getTableHandle(session, tableName, startVersion, endVersion);
             if (handle == null) {
                 return null;
             }

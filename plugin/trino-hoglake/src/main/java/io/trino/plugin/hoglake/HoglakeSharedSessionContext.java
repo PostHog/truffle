@@ -103,16 +103,45 @@ final class HoglakeSharedSessionContext
      */
     public boolean readsTeamSchema(String schemaName)
     {
-        if (storage.isEmpty() || !TEAM_SCHEMA.matcher(schemaName).matches()) {
+        return storage.isPresent() && isTeamSchema(schemaName) && holdsTeam(schemaName);
+    }
+
+    /**
+     * Whether the name is a canonical team schema that this token, which carries the
+     * profile, does not hold. Such a schema is answered as one that does not exist.
+     */
+    public boolean isTeamSchemaOutsideGrant(String schemaName)
+    {
+        return storage.isPresent() && holdsNoTeamSchema(schemaName);
+    }
+
+    /**
+     * Whether the name is a canonical team schema that this token does not hold,
+     * whether or not it carries the profile. Nothing is ever asked of the server for
+     * such a schema: for this caller it does not exist.
+     */
+    public boolean holdsNoTeamSchema(String schemaName)
+    {
+        return isTeamSchema(schemaName) && !holdsTeam(schemaName);
+    }
+
+    private static boolean isTeamSchema(String schemaName)
+    {
+        if (!TEAM_SCHEMA.matcher(schemaName).matches()) {
             return false;
         }
-        String id = schemaName.substring("team_".length());
         try {
-            Long.parseLong(id);
+            Long.parseLong(schemaName.substring("team_".length()));
         }
         catch (NumberFormatException _) {
             return false;
         }
+        return true;
+    }
+
+    private boolean holdsTeam(String schemaName)
+    {
+        String id = schemaName.substring("team_".length());
         Predicate teams = predicates.get("team_id");
         return teams != null && (teams.read().contains(id) || teams.read().contains("*"));
     }
