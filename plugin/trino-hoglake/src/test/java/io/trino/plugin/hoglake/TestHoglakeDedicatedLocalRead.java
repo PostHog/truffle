@@ -288,7 +288,7 @@ final class TestHoglakeDedicatedLocalRead
         List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
         try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> routeRemoteTable(request, "catalog-a", "team_4", "events", ALICE_TABLE_UUID, 5L, dataPath, parquetBytes.length, 999L, null));
                 HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forRemoteTeamSchema(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), fileSystems, REMOTE_TARGETS);
-                StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                StandaloneQueryRunner runner = createRunner(readPath)) {
             Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
 
             MaterializedResult rows = runner.execute(session, "SELECT id, label FROM hoglake.team_4.events ORDER BY id");
@@ -368,7 +368,7 @@ final class TestHoglakeDedicatedLocalRead
                 List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
                 try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> routeRemoteTable(request, "catalog-a", "team_4", "events", ALICE_TABLE_UUID, 5L, file, parquetBytes.length, 999L, deletePath));
                         HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forRemoteTeamSchema(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), fileSystems, REMOTE_TARGETS);
-                        StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                        StandaloneQueryRunner runner = createRunner(readPath)) {
                     Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
                     // A count that metadata alone could answer is refused like a read of the rows.
                     for (String sql : List.of("SELECT count(*) FROM hoglake.team_4.events", "SELECT id FROM hoglake.team_4.events")) {
@@ -398,7 +398,7 @@ final class TestHoglakeDedicatedLocalRead
         // The server answers team_4 as a local namespace with a local table: a name collision, not a relay.
         try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> routeLocalTable(request, "catalog-a", "team_4", "events", ALICE_TABLE_UUID, 5L, "s3://example-remote/events/team_id=4/part-0.parquet", 10, 1L, null));
                 HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forRemoteTeamSchema(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), fileSystems, REMOTE_TARGETS);
-                StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                StandaloneQueryRunner runner = createRunner(readPath)) {
             Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
             assertThatThrownBy(() -> runner.execute(session, "SELECT id FROM hoglake.team_4.events"))
                     .isInstanceOf(QueryFailedException.class);
@@ -432,7 +432,7 @@ final class TestHoglakeDedicatedLocalRead
                     ? namespaceAnswer
                     : routeRemoteTable(request, "catalog-a", "team_4", "events", ALICE_TABLE_UUID, 5L, dataPath, parquetBytes.length, 1L, null));
                     HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forRemoteTeamSchema(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), fileSystems, REMOTE_TARGETS);
-                    StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                    StandaloneQueryRunner runner = createRunner(readPath)) {
                 Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
                 for (String sql : List.of("SELECT id FROM hoglake.team_4.events", "SELECT count(*) FROM hoglake.team_4.events")) {
                     assertThatThrownBy(() -> runner.execute(session, sql))
@@ -463,7 +463,7 @@ final class TestHoglakeDedicatedLocalRead
                     ? new Response(500, "{\"error\":\"sensitive-response-body\"}")
                     : routeRemoteTable(request, "catalog-a", "team_4", "events", ALICE_TABLE_UUID, 5L, null, 0, 1L, null));
                     HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forRemoteTeamSchema(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), new CredentialCheckingFileSystemFactory(Map.of()), REMOTE_TARGETS);
-                    StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                    StandaloneQueryRunner runner = createRunner(readPath)) {
                 Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
                 String sql = failing.endsWith("/tables") ? "SHOW TABLES FROM hoglake.team_4" : "SELECT id FROM hoglake.team_4.events";
                 assertThatThrownBy(() -> runner.execute(session, sql))
@@ -621,7 +621,7 @@ final class TestHoglakeDedicatedLocalRead
                 ? routeLocalTable(request, "catalog-a", "local_team_4", "metrics", BOB_TABLE_UUID, 8L, localPath, localBytes.length, 999L, null)
                 : routeRemoteTable(request, "catalog-a", "team_4", "events", ALICE_TABLE_UUID, 5L, remotePath, remoteBytes.length, 999L, null));
                 HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forSharedReadSession(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), fileSystems, REMOTE_TARGETS);
-                StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                StandaloneQueryRunner runner = createRunner(readPath)) {
             Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
 
             // Reads both remote team_4 and local local_team_4 with the same session token.
@@ -684,7 +684,7 @@ final class TestHoglakeDedicatedLocalRead
                     ? routeLocalTable(request, "catalog-a", "local_team_4", "metrics", BOB_TABLE_UUID, 8L, localFile, parquetBytes.length, 999L, localDelete)
                     : routeRemoteTable(request, "catalog-a", "team_4", "events", ALICE_TABLE_UUID, 5L, remoteFile, parquetBytes.length, 999L, remoteDelete));
                     HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forSharedReadSession(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), fileSystems, REMOTE_TARGETS);
-                    StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                    StandaloneQueryRunner runner = createRunner(readPath)) {
                 Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
 
                 for (String sql : List.of(
@@ -724,7 +724,7 @@ final class TestHoglakeDedicatedLocalRead
                     ? namespaceAnswer
                     : routeLocalTable(request, "catalog-a", "local_team_4", "metrics", BOB_TABLE_UUID, 8L, localPath, parquetBytes.length, 1L, null));
                     HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forSharedReadSession(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), fileSystems, REMOTE_TARGETS);
-                    StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                    StandaloneQueryRunner runner = createRunner(readPath)) {
                 Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "local_team_4");
                 for (String sql : List.of("SELECT id FROM hoglake.local_team_4.metrics", "SELECT count(*) FROM hoglake.local_team_4.metrics")) {
                     assertThatThrownBy(() -> runner.execute(session, sql))
@@ -755,7 +755,7 @@ final class TestHoglakeDedicatedLocalRead
                     ? new Response(500, "application/json", "{\"error\":\"sensitive-local-body\"}".getBytes(UTF_8), Map.of("X-Hoglake-Local-Only", "true"))
                     : routeLocalTable(request, "catalog-a", "local_team_4", "metrics", BOB_TABLE_UUID, 8L, null, 0, 1L, null));
                     HoglakeDedicatedReadPath readPath = HoglakeDedicatedReadPath.forSharedReadSession(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), new CredentialCheckingFileSystemFactory(Map.of()), REMOTE_TARGETS);
-                    StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                    StandaloneQueryRunner runner = createRunner(readPath)) {
                 Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "local_team_4");
                 assertThatThrownBy(() -> runner.execute(session, "SELECT id FROM hoglake.local_team_4.metrics"))
                         .as(failing)
@@ -856,7 +856,7 @@ final class TestHoglakeDedicatedLocalRead
                         Duration.ofSeconds(10),
                         verifier(jwksFile),
                         fileSystems);
-                StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                StandaloneQueryRunner runner = createRunner(readPath)) {
             Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "reports");
 
             MaterializedResult rows = runner.execute(session, "SELECT id, label FROM hoglake.reports.metrics ORDER BY id");
@@ -969,7 +969,7 @@ final class TestHoglakeDedicatedLocalRead
                         Duration.ofSeconds(10),
                         verifier(jwksFile),
                         fileSystems);
-                StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                StandaloneQueryRunner runner = createRunner(readPath)) {
             Session aliceSession = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "reports");
             Session bobSession = querySession(bob.mappedUser(), bob.principal(), bob.jwt(), "reports");
 
@@ -1419,7 +1419,7 @@ final class TestHoglakeDedicatedLocalRead
                         Duration.ofSeconds(10),
                         verifier(jwksFile),
                         fileSystems);
-                StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                StandaloneQueryRunner runner = createRunner(readPath)) {
             Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "reports");
 
             MaterializedResult rows = runner.execute(session, "SELECT id, label FROM hoglake.reports.metrics ORDER BY id");
@@ -1485,7 +1485,7 @@ final class TestHoglakeDedicatedLocalRead
                             Duration.ofSeconds(10),
                             verifier(jwksFile),
                             fileSystems);
-                    StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                    StandaloneQueryRunner runner = createRunner(readPath)) {
                 Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "reports");
                 ConnectorSession connectorSession = session.toConnectorSession(CATALOG_HANDLE);
 
@@ -1553,7 +1553,7 @@ final class TestHoglakeDedicatedLocalRead
                         Duration.ofSeconds(10),
                         verifier(jwksFile),
                         fileSystems);
-                StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                StandaloneQueryRunner runner = createRunner(readPath)) {
             Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
 
             // The local namespace with the relayed team name answers the metadata lookup and the pinned scan.
@@ -1626,7 +1626,7 @@ final class TestHoglakeDedicatedLocalRead
                         Duration.ofSeconds(10),
                         verifier(jwksFile),
                         noStorage);
-                StandaloneQueryRunner runner = createRunner(readPath, verifier(jwksFile))) {
+                StandaloneQueryRunner runner = createRunner(readPath)) {
             Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "team_4");
             ConnectorSession connectorSession = session.toConnectorSession(CATALOG_HANDLE);
 
@@ -1793,7 +1793,7 @@ final class TestHoglakeDedicatedLocalRead
         return ImmutableMap.copyOf(copy);
     }
 
-    private static StandaloneQueryRunner createRunner(HoglakeDedicatedReadPath readPath, HoglakeReadSessionVerifier verifier)
+    private static StandaloneQueryRunner createRunner(HoglakeDedicatedReadPath readPath)
     {
         Session baseSession = testSessionBuilder().setCatalog("hoglake").setSchema("reports").build();
         StandaloneQueryRunner runner = new StandaloneQueryRunner(baseSession);
