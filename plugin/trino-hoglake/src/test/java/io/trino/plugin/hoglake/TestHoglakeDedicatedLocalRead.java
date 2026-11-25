@@ -45,7 +45,9 @@ import io.trino.spi.connector.ConnectorContext;
 import io.trino.spi.connector.ConnectorFactory;
 import io.trino.spi.connector.ConnectorMetadata;
 import io.trino.spi.connector.ConnectorPageSource;
+import io.trino.spi.connector.ConnectorPageSourceProvider;
 import io.trino.spi.connector.ConnectorSession;
+import io.trino.spi.connector.ConnectorSplitManager;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
 import io.trino.spi.connector.Constraint;
@@ -57,6 +59,8 @@ import io.trino.spi.security.AccessDeniedException;
 import io.trino.spi.security.BasicPrincipal;
 import io.trino.spi.security.ConnectorIdentity;
 import io.trino.spi.security.Identity;
+import io.trino.spi.session.PropertyMetadata;
+import io.trino.spi.transaction.IsolationLevel;
 import io.trino.testing.MaterializedResult;
 import io.trino.testing.QueryFailedException;
 import io.trino.testing.StandaloneQueryRunner;
@@ -1225,11 +1229,14 @@ final class TestHoglakeDedicatedLocalRead
                 DedicatedTestServer metadataServer = DedicatedTestServer.start(new CopyOnWriteArrayList<>(), _ -> new Response(404, "{}"))) {
             Map<String, String> properties = ImmutableMap.<String, String>builder()
                     .put("hoglake.uri", metadataServer.baseUri().toASCIIString())
-                    .put("hoglake.dedicated.local-read", "true")
-                    .put("hoglake.dedicated.jwks-file", jwksFile.toString())
-                    .put("hoglake.dedicated.issuer", ISSUER)
-                    .put("hoglake.dedicated.remote-targets", EVENTS_TARGET + "," + IMPORTS_TARGET)
-                    .put("hoglake.dedicated.hoglite-backends", BACKEND_ID)
+                    .put("hoglake.multi-tenant", "true")
+                    .put("hoglake.shared.remote-read", "true")
+                    .put("hoglake.shared.read-session-local-read", "true")
+                    .put("hoglake.shared.read-session-profile", HoglakeReadSessionVerifier.DEFAULT_PROFILE)
+                    .put("hoglake.shared.jwks-file", jwksFile.toString())
+                    .put("hoglake.shared.issuer", ISSUER)
+                    .put("hoglake.shared.read-session-remote-targets", EVENTS_TARGET + "," + IMPORTS_TARGET)
+                    .put("hoglake.shared.backend-bindings", "{\"%s\":\"hoglite\"}".formatted(BACKEND_ID))
                     .put("s3.region", REGION)
                     .put("s3.endpoint", s3Server.baseUri().toASCIIString())
                     .put("s3.path-style-access", "true")
@@ -1314,11 +1321,14 @@ final class TestHoglakeDedicatedLocalRead
                 DedicatedTestServer metadataServer = DedicatedTestServer.start(new CopyOnWriteArrayList<>(), _ -> new Response(404, "{}"))) {
             Map<String, String> properties = ImmutableMap.<String, String>builder()
                     .put("hoglake.uri", metadataServer.baseUri().toASCIIString())
-                    .put("hoglake.dedicated.local-read", "true")
-                    .put("hoglake.dedicated.jwks-file", jwksFile.toString())
-                    .put("hoglake.dedicated.issuer", ISSUER)
-                    .put("hoglake.dedicated.remote-targets", EVENTS_TARGET + "," + IMPORTS_TARGET)
-                    .put("hoglake.dedicated.hoglite-backends", BACKEND_ID)
+                    .put("hoglake.multi-tenant", "true")
+                    .put("hoglake.shared.remote-read", "true")
+                    .put("hoglake.shared.read-session-local-read", "true")
+                    .put("hoglake.shared.read-session-profile", HoglakeReadSessionVerifier.DEFAULT_PROFILE)
+                    .put("hoglake.shared.jwks-file", jwksFile.toString())
+                    .put("hoglake.shared.issuer", ISSUER)
+                    .put("hoglake.shared.read-session-remote-targets", EVENTS_TARGET + "," + IMPORTS_TARGET)
+                    .put("hoglake.shared.backend-bindings", "{\"%s\":\"hoglite\"}".formatted(BACKEND_ID))
                     .put("s3.region", REGION)
                     .put("s3.endpoint", s3Server.baseUri().toASCIIString())
                     .put("s3.path-style-access", "true")
@@ -1731,35 +1741,37 @@ final class TestHoglakeDedicatedLocalRead
         Path jwksFile = directory.resolve("factory-jwks.json");
         writeJwks(jwksFile, key, KID);
 
-        Map<String, String> validDedicated = ImmutableMap.<String, String>builder()
+        Map<String, String> validShared = ImmutableMap.<String, String>builder()
                 .put("hoglake.uri", "https://metadata.example.test")
-                .put("hoglake.dedicated.local-read", "true")
-                .put("hoglake.dedicated.jwks-file", jwksFile.toString())
-                .put("hoglake.dedicated.issuer", ISSUER)
-                .put("hoglake.dedicated.remote-targets", EVENTS_TARGET + "," + IMPORTS_TARGET)
-                .put("hoglake.dedicated.hoglite-backends", BACKEND_ID)
+                .put("hoglake.multi-tenant", "true")
+                .put("hoglake.shared.remote-read", "true")
+                .put("hoglake.shared.read-session-local-read", "true")
+                .put("hoglake.shared.read-session-profile", HoglakeReadSessionVerifier.DEFAULT_PROFILE)
+                .put("hoglake.shared.jwks-file", jwksFile.toString())
+                .put("hoglake.shared.issuer", ISSUER)
+                .put("hoglake.shared.read-session-remote-targets", EVENTS_TARGET + "," + IMPORTS_TARGET)
+                .put("hoglake.shared.backend-bindings", "{\"%s\":\"hoglite\"}".formatted(BACKEND_ID))
                 .put("s3.region", REGION)
                 .buildOrThrow();
 
-        // Valid dedicated configuration boots a HoglakeDedicatedConnector.
-        Connector dedicated = new HoglakeConnectorFactory().create("hoglake", validDedicated, new TestingConnectorContext());
+        // Valid shared read-session configuration boots a HoglakeSharedConnector.
+        Connector shared = new HoglakeConnectorFactory().create("hoglake", validShared, new TestingConnectorContext());
         try {
-            assertThat(dedicated).isInstanceOf(HoglakeDedicatedConnector.class);
+            assertThat(shared).isInstanceOf(HoglakeSharedConnector.class);
         }
         finally {
-            dedicated.shutdown();
+            shared.shutdown();
         }
 
-        // Refuse static credentials, ambient IAM roles, caches, and conflicting connector modes.
+        // Refuse static credentials, ambient IAM roles, caches, and retired dedicated properties.
         List<Map<String, String>> invalidConfigs = List.of(
-                withProperty(validDedicated, "s3.aws-access-key", "STATIC_KEY"),
-                withProperty(validDedicated, "s3.aws-secret-key", "STATIC_SECRET"),
-                withProperty(validDedicated, "s3.iam-role", "arn:aws:iam::000000000000:role/example"),
-                withProperty(validDedicated, "fs.cache.enabled", "true"),
-                withProperty(validDedicated, "fs.native-s3.enabled", "true"),
-                withProperty(validDedicated, "hoglake.multi-tenant", "true"),
-                withProperty(validDedicated, "hoglake.dedicated.local-read", "maybe"),
-                withoutProperty(validDedicated, "s3.region"));
+                withProperty(validShared, "s3.aws-access-key", "STATIC_KEY"),
+                withProperty(validShared, "s3.aws-secret-key", "STATIC_SECRET"),
+                withProperty(validShared, "s3.iam-role", "arn:aws:iam::000000000000:role/example"),
+                withProperty(validShared, "fs.cache.enabled", "true"),
+                withProperty(validShared, "fs.native-s3.enabled", "true"),
+                withProperty(validShared, "hoglake.dedicated.local-read", "true"),
+                withoutProperty(validShared, "s3.region"));
 
         for (Map<String, String> invalid : invalidConfigs) {
             assertThatThrownBy(() -> new HoglakeConnectorFactory().create("hoglake", invalid, new TestingConnectorContext()))
@@ -1801,7 +1813,56 @@ final class TestHoglakeDedicatedLocalRead
                     @Override
                     public Connector create(String catalogName, Map<String, String> config, ConnectorContext context)
                     {
-                        return new HoglakeDedicatedConnector(readPath, verifier, () -> {});
+                        return new Connector()
+                        {
+                            @Override
+                            public ConnectorTransactionHandle beginTransaction(IsolationLevel isolationLevel, boolean readOnly, boolean autoCommit)
+                            {
+                                return new HoglakeTransactionHandle(UUID.randomUUID());
+                            }
+
+                            @Override
+                            public ConnectorMetadata getMetadata(ConnectorSession session, ConnectorTransactionHandle transactionHandle)
+                            {
+                                return readPath.metadata(session, transactionHandle);
+                            }
+
+                            @Override
+                            public List<PropertyMetadata<?>> getSessionProperties()
+                            {
+                                return new HoglakeSessionProperties(new HoglakeConfig()).getSessionProperties();
+                            }
+
+                            @Override
+                            public ConnectorSplitManager getSplitManager()
+                            {
+                                return readPath.splitManager();
+                            }
+
+                            @Override
+                            public ConnectorPageSourceProvider getPageSourceProvider()
+                            {
+                                return readPath.pageSourceProvider();
+                            }
+
+                            @Override
+                            public void commit(ConnectorTransactionHandle transactionHandle)
+                            {
+                                readPath.end(transactionHandle);
+                            }
+
+                            @Override
+                            public void rollback(ConnectorTransactionHandle transactionHandle)
+                            {
+                                readPath.end(transactionHandle);
+                            }
+
+                            @Override
+                            public void shutdown()
+                            {
+                                readPath.close();
+                            }
+                        };
                     }
                 });
             }
