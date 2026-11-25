@@ -73,6 +73,7 @@ import static io.trino.spi.StandardErrorCode.TABLE_NOT_FOUND;
 import static io.trino.testing.TestingSession.testSessionBuilder;
 import static io.trino.testing.assertions.TrinoExceptionAssert.assertTrinoExceptionThrownBy;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Locale.ENGLISH;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -591,8 +592,9 @@ final class TestHoglakeSharedRemoteRead
                     CATALOG_PATH + "/namespaces/ns1/tables",
                     CATALOG_PATH + "/namespaces/team_7/tables");
 
-            // A server that wrongly lists a team the token does not hold: the team is
-            // dropped from the listing, and nothing is asked for it
+            // A server that wrongly lists a team the token does not hold, in any case, and
+            // a name that is not lowercase: each is dropped from the listing, and nothing
+            // is asked for it
             fixture.listsUnheldTeam = true;
             fixture.requests.clear();
             assertThat(runner.execute(session, "SHOW SCHEMAS FROM hoglake").getOnlyColumnAsSet())
@@ -604,7 +606,7 @@ final class TestHoglakeSharedRemoteRead
             assertThat(runner.execute(session, "SELECT DISTINCT table_schema FROM hoglake.information_schema.columns").getOnlyColumnAsSet())
                     .containsExactly("information_schema");
             assertThat(fixture.requests).extracting(Request::path)
-                    .noneMatch(path -> path.contains("team_4243"))
+                    .noneMatch(path -> path.toLowerCase(ENGLISH).contains("team_4243") || path.contains("Mixed"))
                     .allSatisfy(path -> assertThat(path).isIn(
                             CATALOG_PATH + "/namespaces",
                             CATALOG_PATH + "/namespaces/ns1/tables",
@@ -872,7 +874,8 @@ final class TestHoglakeSharedRemoteRead
         private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
         private final List<Request> requests = new CopyOnWriteArrayList<>();
         private final AtomicReference<String> unexpected = new AtomicReference<>();
-        // A server that wrongly lists a team schema no caller here holds
+        // A server that wrongly lists a team schema no caller here holds, in lowercase
+        // and in uppercase, and a schema whose name is not lowercase
         private volatile boolean listsUnheldTeam;
 
         public Fixture(Path directory)
@@ -973,7 +976,7 @@ final class TestHoglakeSharedRemoteRead
                 return null;
             }
             if (request.path().equals(namespaces) && listsUnheldTeam) {
-                return "[{\"name\":\"ns1\",\"namespace_id\":1},{\"name\":\"team_7\",\"remote\":true},{\"name\":\"team_4243\",\"remote\":true}]";
+                return "[{\"name\":\"ns1\",\"namespace_id\":1},{\"name\":\"team_7\",\"remote\":true},{\"name\":\"team_4243\",\"remote\":true},{\"name\":\"TEAM_4243\",\"remote\":true},{\"name\":\"Mixed\",\"namespace_id\":2}]";
             }
             if (request.path().equals(namespaces) && !namesTeam7(request.authorization())) {
                 // As the server, list a team schema only to a token that names the team: a

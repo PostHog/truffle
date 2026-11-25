@@ -99,6 +99,7 @@ import java.util.function.UnaryOperator;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
+import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 
 /**
@@ -368,10 +369,13 @@ public final class HoglakeSharedConnector
         {
             HoglakeSharedSessionContext context = verifier.verify(session);
             // The server lists only the token's teams; a team the token does not hold is
-            // dropped here too, should it ever be listed
+            // dropped here too, should it ever be listed, in any case. A name that is not
+            // lowercase is dropped as well: a Trino schema name is lowercase, so the
+            // engine could only address it by another name. Listing tables with no schema
+            // given uses this list, so nothing is asked for a dropped name.
             return client.listNamespaces(session).stream()
                     .map(HoglakeDtos.Namespace::name)
-                    .filter(name -> !context.holdsNoTeamSchema(name))
+                    .filter(name -> name.equals(name.toLowerCase(ENGLISH)) && !context.holdsNoTeamSchema(name))
                     .collect(toImmutableList());
         }
 
