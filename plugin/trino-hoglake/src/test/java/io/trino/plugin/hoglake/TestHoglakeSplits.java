@@ -328,6 +328,30 @@ class TestHoglakeSplits
     }
 
     @Test
+    void evenCutsAreBoundedWhateverSizeTheCatalogReports()
+    {
+        int limit = HoglakeSplitManager.MAX_EVEN_RANGES_PER_FILE;
+
+        // At the limit the target size still decides the cuts.
+        List<HoglakeSplitManager.ByteRange> atLimit = HoglakeSplitManager.planRanges(limit * TARGET, OptionalLong.empty(), List.of(), TARGET);
+        assertThat(atLimit).hasSize(limit);
+        assertThat(atLimit).allSatisfy(range -> assertThat(range.length()).isEqualTo(TARGET));
+
+        for (long size : List.of(limit * TARGET + 1, 1L << 50, Long.MAX_VALUE - 1, Long.MAX_VALUE)) {
+            List<HoglakeSplitManager.ByteRange> ranges = HoglakeSplitManager.planRanges(size, OptionalLong.empty(), List.of(), TARGET);
+            assertThat(ranges).describedAs("size %s", size).hasSizeLessThanOrEqualTo(limit);
+            // Still a contiguous cover of the reported size.
+            long next = 0;
+            for (HoglakeSplitManager.ByteRange range : ranges) {
+                assertThat(range.start()).describedAs("size %s", size).isEqualTo(next);
+                assertThat(range.length()).describedAs("size %s", size).isPositive();
+                next = range.start() + range.length();
+            }
+            assertThat(next).describedAs("size %s", size).isEqualTo(size);
+        }
+    }
+
+    @Test
     void unusableSplitOffsetsFallBackToEvenCuts()
     {
         List<HoglakeSplitManager.ByteRange> evenCuts = HoglakeSplitManager.planRanges(2500, OptionalLong.of(10), List.of(), TARGET);
