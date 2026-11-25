@@ -122,7 +122,6 @@ import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.trino.spi.StandardErrorCode.PERMISSION_DENIED;
 import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
-import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
 /**
  * Dedicated local table read path backed by offline read session verification.
@@ -157,14 +156,6 @@ final class HoglakeDedicatedReadPath
     private final ConnectorSplitManager splitManager;
     private final ConnectorPageSourceProvider pageSourceProvider;
     private final Map<ConnectorTransactionHandle, Reader> readers = new ConcurrentHashMap<>();
-
-    HoglakeDedicatedReadPath(HoglakeDedicatedConfig config, HoglakeReadSessionVerifier verifier, TrinoFileSystemFactory fileSystemFactory)
-    {
-        this(config.getUri(),
-                Duration.ofNanos(config.getRequestTimeout().roundTo(NANOSECONDS)),
-                verifier,
-                fileSystemFactory);
-    }
 
     HoglakeDedicatedReadPath(URI baseUri, Duration requestTimeout, HoglakeReadSessionVerifier verifier, TrinoFileSystemFactory fileSystemFactory)
     {
