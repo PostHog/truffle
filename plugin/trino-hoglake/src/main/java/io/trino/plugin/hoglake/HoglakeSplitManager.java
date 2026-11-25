@@ -87,6 +87,11 @@ public class HoglakeSplitManager
     private static final int PARQUET_TRAILER_SIZE = Integer.BYTES + 4;
     private static final double MINIMUM_SPLIT_WEIGHT = 0.05;
 
+    /**
+     * The most ranges even cuts make of one file, whatever size the catalog reports for it.
+     */
+    static final int MAX_EVEN_RANGES_PER_FILE = 1024;
+
     private final HoglakeClient client;
     private final Function<ConnectorSession, DataSize> maxSplitSize;
     private final SplitAffinityProvider affinityProvider;
@@ -285,11 +290,25 @@ public class HoglakeSplitManager
         return cuts.build();
     }
 
+    /**
+     * Even cuts, at most {@link #MAX_EVEN_RANGES_PER_FILE} ranges for one
+     * file. The file size comes from a catalog answer, so a huge value must
+     * not decide how many splits the coordinator holds: past the limit the
+     * ranges grow instead. The worker reads the file's real footer, so wider
+     * ranges still read every row group exactly once.
+     */
     private static List<Long> evenCuts(long fileSizeBytes, long maxSplitSize)
     {
+        long step = Math.max(maxSplitSize, Math.ceilDiv(fileSizeBytes, (long) MAX_EVEN_RANGES_PER_FILE));
         ImmutableList.Builder<Long> cuts = ImmutableList.builder();
-        for (long cut = maxSplitSize; cut < fileSizeBytes; cut += maxSplitSize) {
+        long cut = step;
+        while (cut < fileSizeBytes) {
             cuts.add(cut);
+            // Compared by the remainder: adding the step first could overflow.
+            if (fileSizeBytes - cut <= step) {
+                break;
+            }
+            cut += step;
         }
         return cuts.build();
     }
