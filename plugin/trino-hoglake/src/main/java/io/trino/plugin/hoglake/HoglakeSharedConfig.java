@@ -48,6 +48,7 @@ public class HoglakeSharedConfig
     private Duration scopedMaxLifetime = new Duration(900, SECONDS);
     private Optional<String> readSessionProfile = Optional.empty();
     private Set<String> readSessionRemoteTargets = ImmutableSet.of();
+    private boolean readSessionLocalRead;
 
     @NotNull
     public URI getUri()
@@ -202,7 +203,7 @@ public class HoglakeSharedConfig
     }
 
     @Config("hoglake.shared.read-session-profile")
-    @ConfigDescription("Token profile of dedicated read sessions that may read their own remote team schema; requires remote read")
+    @ConfigDescription("Token profile of dedicated read sessions that may read their own remote team schema and non-reserved local schemas; requires remote read")
     public HoglakeSharedConfig setReadSessionProfile(String readSessionProfile)
     {
         this.readSessionProfile = Optional.ofNullable(readSessionProfile);
@@ -220,6 +221,19 @@ public class HoglakeSharedConfig
     public HoglakeSharedConfig setReadSessionRemoteTargets(Set<String> readSessionRemoteTargets)
     {
         this.readSessionRemoteTargets = readSessionRemoteTargets == null ? ImmutableSet.of() : ImmutableSet.copyOf(readSessionRemoteTargets);
+        return this;
+    }
+
+    public boolean isReadSessionLocalRead()
+    {
+        return readSessionLocalRead;
+    }
+
+    @Config("hoglake.shared.read-session-local-read")
+    @ConfigDescription("Allow dedicated read sessions to also read non-reserved local schemas on the shared catalog; requires read-session-profile")
+    public HoglakeSharedConfig setReadSessionLocalRead(boolean readSessionLocalRead)
+    {
+        this.readSessionLocalRead = readSessionLocalRead;
         return this;
     }
 }

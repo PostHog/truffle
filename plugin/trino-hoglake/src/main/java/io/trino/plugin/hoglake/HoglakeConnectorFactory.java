@@ -236,7 +236,8 @@ public class HoglakeConnectorFactory
             Optional<HoglakeSharedReadPath> readPath = Optional.empty();
             Optional<HoglakeDedicatedReadPath> readSessions = Optional.empty();
             if (config.getReadSessionProfile().isPresent() != !config.getReadSessionRemoteTargets().isEmpty()
-                    || (config.getReadSessionProfile().isPresent() && storageRegion.isEmpty())) {
+                    || (config.getReadSessionProfile().isPresent() && storageRegion.isEmpty())
+                    || (config.isReadSessionLocalRead() && config.getReadSessionProfile().isEmpty())) {
                 throw new IllegalArgumentException("Invalid shared Hoglake read session configuration");
             }
             if (storageRegion.isPresent()) {
@@ -257,7 +258,14 @@ public class HoglakeConnectorFactory
                             config.getScopedMaxLifetime().roundTo(SECONDS),
                             Clock.systemUTC(),
                             System::nanoTime);
-                    readSessions = Optional.of(HoglakeDedicatedReadPath.forRemoteTeamSchema(
+                    readSessions = Optional.of(config.isReadSessionLocalRead()
+                            ? HoglakeDedicatedReadPath.forSharedReadSession(
+                            config.getUri(),
+                            Duration.ofNanos(config.getRequestTimeout().roundTo(NANOSECONDS)),
+                            readSessionVerifier,
+                            fileSystemFactory,
+                            config.getReadSessionRemoteTargets())
+                            : HoglakeDedicatedReadPath.forRemoteTeamSchema(
                             config.getUri(),
                             Duration.ofNanos(config.getRequestTimeout().roundTo(NANOSECONDS)),
                             readSessionVerifier,
