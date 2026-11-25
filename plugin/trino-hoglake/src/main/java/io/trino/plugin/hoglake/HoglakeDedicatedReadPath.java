@@ -140,6 +140,7 @@ final class HoglakeDedicatedReadPath
 
     private static final String DISCOVERY_FAILED = "Hoglake read session metadata request failed";
     private static final String REMOTE_TABLE_DENIED = "Hoglake read session requires a valid pinned table of its own team schema";
+    private static final Pattern TEAM_SCHEMA_ANY = Pattern.compile("team_[0-9]+");
     private static final Pattern NAMESPACE_ROUTE = Pattern.compile("/namespaces/([^/]+)");
     private static final Pattern TABLES_ROUTE = Pattern.compile("/namespaces/([^/]+)/tables");
     private static final Pattern TABLE_ROUTE = Pattern.compile("/namespaces/([^/]+)/tables/([^/]+)");
@@ -167,7 +168,7 @@ final class HoglakeDedicatedReadPath
 
     HoglakeDedicatedReadPath(URI baseUri, Duration requestTimeout, HoglakeReadSessionVerifier verifier, TrinoFileSystemFactory fileSystemFactory)
     {
-        this(baseUri, requestTimeout, verifier, fileSystemFactory, ImmutableSet.of());
+        this(baseUri, requestTimeout, verifier, fileSystemFactory, Scope.Mode.LOCAL_ONLY, ImmutableSet.of());
     }
 
     /**
@@ -184,7 +185,25 @@ final class HoglakeDedicatedReadPath
         if (remoteTargets == null || remoteTargets.size() != 2) {
             throw new IllegalArgumentException("Invalid Hoglake read session configuration");
         }
-        return new HoglakeDedicatedReadPath(baseUri, requestTimeout, verifier, fileSystemFactory, remoteTargets);
+        return new HoglakeDedicatedReadPath(baseUri, requestTimeout, verifier, fileSystemFactory, Scope.Mode.REMOTE_ONLY, remoteTargets);
+    }
+
+    /**
+     * Combined read session on the shared catalog: the caller's own team schema uses the relayed
+     * remote routes and {@code remoteTargets} grants; non-reserved local schemas use local-only
+     * routes and the primary-catalog grant. Other reserved schemas are absent with no fallback.
+     */
+    static HoglakeDedicatedReadPath forSharedReadSession(
+            URI baseUri,
+            Duration requestTimeout,
+            HoglakeReadSessionVerifier verifier,
+            TrinoFileSystemFactory fileSystemFactory,
+            Set<String> remoteTargets)
+    {
+        if (remoteTargets == null || remoteTargets.size() != 2) {
+            throw new IllegalArgumentException("Invalid Hoglake read session configuration");
+        }
+        return new HoglakeDedicatedReadPath(baseUri, requestTimeout, verifier, fileSystemFactory, Scope.Mode.COMBINED, remoteTargets);
     }
 
     private HoglakeDedicatedReadPath(
@@ -192,9 +211,10 @@ final class HoglakeDedicatedReadPath
             Duration requestTimeout,
             HoglakeReadSessionVerifier verifier,
             TrinoFileSystemFactory fileSystemFactory,
+            Scope.Mode mode,
             Set<String> remoteTargets)
     {
-        this.scope = new Scope(remoteTargets);
+        this.scope = new Scope(mode, remoteTargets);
         this.verifier = requireNonNull(verifier, "verifier is null");
         this.baseUri = HoglakeClient.validateBaseUri(requireNonNull(baseUri, "baseUri is null").toASCIIString()).toString();
         String path = URI.create(this.baseUri).getRawPath();
@@ -289,7 +309,7 @@ final class HoglakeDedicatedReadPath
     {
         Reader reader = readers.remove(transaction);
         if (reader != null) {
-            reader.client().close();
+            reader.close();
         }
     }
 
@@ -312,19 +332,29 @@ final class HoglakeDedicatedReadPath
 
     private Reader newReader(HoglakeReadSessionContext context)
     {
-        // Local-only routes: Hoglake reads only the caller's own local warehouse and never relays a
-        // remote schema. A missing name is ordinary absence. An answer without the marker is refused.
-        HoglakeClient client = new HoglakeClient(
+        Optional<HoglakeClient> remoteClient = scope.supportsRemote()
+                ? Optional.of(new HoglakeClient(
                 baseUri,
                 context.catalog(),
                 requestTimeout,
                 new HoglakeTokenSource.Fixed(context.token()),
                 httpClient,
-                scope.remote()
-                        ? createRemoteRouteGuard(basePath, context.catalog(), scope.teamSchema(context))
-                        : createRouteGuard(basePath, context.catalog()),
-                !scope.remote());
-        return new Reader(context.token(), context, client, new ConcurrentHashMap<>(), scope);
+                createRemoteRouteGuard(basePath, context.catalog(), scope.teamSchema(context)),
+                false))
+                : Optional.empty();
+        // Local-only routes: Hoglake reads only the caller's own local warehouse and never relays a
+        // remote schema. A missing name is ordinary absence. An answer without the marker is refused.
+        Optional<HoglakeClient> localClient = scope.supportsLocal()
+                ? Optional.of(new HoglakeClient(
+                baseUri,
+                context.catalog(),
+                requestTimeout,
+                new HoglakeTokenSource.Fixed(context.token()),
+                httpClient,
+                createRouteGuard(basePath, context.catalog()),
+                true))
+                : Optional.empty();
+        return new Reader(context.token(), context, remoteClient, localClient, new ConcurrentHashMap<>(), scope);
     }
 
     /**
@@ -497,27 +527,48 @@ final class HoglakeDedicatedReadPath
     {
         HoglakeTableHandle handle = reader.scope().validate(table, reader.context());
         HoglakeTableHandle pinned = reader.pinnedTables().get(handle.schemaTableName());
-        if (pinned != null && (pinned.snapshotId() != handle.snapshotId() || !pinned.tableUuid().equals(handle.tableUuid()))) {
-            throw reader.scope().tableDenied();
+        if (pinned != null && (pinned.snapshotId() != handle.snapshotId()
+                || !pinned.tableUuid().equals(handle.tableUuid())
+                || pinned.remote() != handle.remote())) {
+            throw reader.scope().tableDenied(handle.remote());
         }
         return handle;
     }
 
     /**
-     * What one read path reads. With no remote targets: local tables, whose files are inside
-     * the primary-catalog grant. With remote targets: tables of the session's own team schema,
-     * whose files are inside a grant of one of those targets.
+     * What one read path reads. LOCAL_ONLY reads local tables under the primary-catalog grant.
+     * REMOTE_ONLY reads the session's own team schema under {@code remoteTargets}.
+     * COMBINED serves the session's own team schema on relayed routes and non-reserved schemas on
+     * local-only routes, with strict grant isolation and no fallback between them.
      */
-    private record Scope(Set<String> remoteTargets)
+    private record Scope(Mode mode, Set<String> remoteTargets)
     {
+        enum Mode
+        {
+            LOCAL_ONLY,
+            REMOTE_ONLY,
+            COMBINED,
+        }
+
         private Scope
         {
+            requireNonNull(mode, "mode is null");
             remoteTargets = ImmutableSet.copyOf(requireNonNull(remoteTargets, "remoteTargets is null"));
         }
 
-        boolean remote()
+        boolean supportsRemote()
         {
-            return !remoteTargets.isEmpty();
+            return mode == Mode.REMOTE_ONLY || mode == Mode.COMBINED;
+        }
+
+        boolean supportsLocal()
+        {
+            return mode == Mode.LOCAL_ONLY || mode == Mode.COMBINED;
+        }
+
+        boolean redactsDiscovery()
+        {
+            return mode != Mode.LOCAL_ONLY;
         }
 
         String teamSchema(HoglakeReadSessionContext context)
@@ -525,24 +576,59 @@ final class HoglakeDedicatedReadPath
             return "team_" + context.teamId();
         }
 
+        static boolean isReservedSchema(String schemaName)
+        {
+            if (schemaName == null) {
+                return false;
+            }
+            String lower = schemaName.toLowerCase(ENGLISH);
+            return lower.equals("posthog") || TEAM_SCHEMA_ANY.matcher(lower).matches();
+        }
+
+        Optional<Boolean> resolveRemote(String schemaName, HoglakeReadSessionContext context)
+        {
+            if (schemaName == null || !schemaName.equals(schemaName.toLowerCase(ENGLISH))) {
+                return Optional.empty();
+            }
+            return switch (mode) {
+                case LOCAL_ONLY -> Optional.of(false);
+                case REMOTE_ONLY -> schemaName.equals(teamSchema(context)) ? Optional.of(true) : Optional.empty();
+                case COMBINED -> {
+                    if (schemaName.equals(teamSchema(context))) {
+                        yield Optional.of(true);
+                    }
+                    if (isReservedSchema(schemaName)) {
+                        yield Optional.empty();
+                    }
+                    yield Optional.of(false);
+                }
+            };
+        }
+
         TrinoException listingDenied()
         {
-            return remote()
+            return supportsRemote()
                     ? new TrinoException(NOT_SUPPORTED, "Hoglake read session does not support this listing")
                     : HoglakeDedicatedReadPath.listingDenied();
         }
 
-        TrinoException tableDenied()
+        TrinoException tableDenied(boolean remote)
         {
-            return remote() ? new TrinoException(PERMISSION_DENIED, REMOTE_TABLE_DENIED) : localTableDenied();
+            return remote && supportsRemote() ? new TrinoException(PERMISSION_DENIED, REMOTE_TABLE_DENIED) : localTableDenied();
         }
 
-        void requireLocation(HoglakeReadSessionContext context, String location)
+        void requireLocation(HoglakeReadSessionContext context, String location, boolean remote)
         {
             String region = context.storage().region();
-            if (!remote()) {
+            if (!remote) {
+                if (!supportsLocal()) {
+                    throw targetDenied();
+                }
                 context.requireStorageLocation(context.catalog(), location, region);
                 return;
+            }
+            if (!supportsRemote()) {
+                throw targetDenied();
             }
             for (String target : remoteTargets) {
                 if (context.allowsStorageLocation(target, location, region)) {
@@ -552,18 +638,37 @@ final class HoglakeDedicatedReadPath
             throw targetDenied();
         }
 
+        void requireAnyConfiguredLocation(HoglakeReadSessionContext context, String location)
+        {
+            String region = context.storage().region();
+            if (supportsLocal() && context.allowsStorageLocation(context.catalog(), location, region)) {
+                return;
+            }
+            if (supportsRemote()) {
+                for (String target : remoteTargets) {
+                    if (context.allowsStorageLocation(target, location, region)) {
+                        return;
+                    }
+                }
+            }
+            throw targetDenied();
+        }
+
         HoglakeTableHandle validate(ConnectorTableHandle table, HoglakeReadSessionContext context)
         {
             if (!(table instanceof HoglakeTableHandle handle)) {
-                throw tableDenied();
+                throw tableDenied(mode == Mode.REMOTE_ONLY);
             }
-            if (handle.remote() != remote()
-                    || (remote() && !teamSchema(context).equals(handle.schemaName()))
+            boolean validMode = handle.remote()
+                    ? supportsRemote() && teamSchema(context).equals(handle.schemaName())
+                    : supportsLocal() && (mode != Mode.COMBINED
+                    || (handle.schemaName().equals(handle.schemaName().toLowerCase(ENGLISH)) && !isReservedSchema(handle.schemaName())));
+            if (!validMode
                     || handle.snapshotId() < 0
                     || !isCanonicalUuid(handle.tableUuid())
                     || !handle.stagedFiles().isEmpty()
                     || !handle.stagedDeletes().isEmpty()) {
-                throw tableDenied();
+                throw tableDenied(handle.remote());
             }
             return handle;
         }
@@ -676,7 +781,7 @@ final class HoglakeDedicatedReadPath
      */
     private <T> T discover(Supplier<T> request)
     {
-        if (!scope.remote()) {
+        if (!scope.redactsDiscovery()) {
             return request.get();
         }
         try {
@@ -714,13 +819,22 @@ final class HoglakeDedicatedReadPath
     private record Reader(
             String token,
             HoglakeReadSessionContext context,
-            HoglakeClient client,
+            Optional<HoglakeClient> remoteClient,
+            Optional<HoglakeClient> localClient,
             Map<SchemaTableName, HoglakeTableHandle> pinnedTables,
             Scope scope)
     {
-        HoglakeClient clientFor(ConnectorSession session)
+        HoglakeClient clientFor(ConnectorSession session, boolean remote)
         {
-            return client.forQuery(session.getQueryId());
+            return (remote ? remoteClient : localClient)
+                    .orElseThrow(HoglakeDedicatedReadPath::requestDenied)
+                    .forQuery(session.getQueryId());
+        }
+
+        void close()
+        {
+            remoteClient.ifPresent(HoglakeClient::close);
+            localClient.ifPresent(HoglakeClient::close);
         }
 
         @Override
@@ -747,7 +861,7 @@ final class HoglakeDedicatedReadPath
                 return new FixedSplitSource(ImmutableList.of());
             }
 
-            List<HoglakeDtos.ScanFile> scanFiles = discover(() -> reader.clientFor(session)
+            List<HoglakeDtos.ScanFile> scanFiles = discover(() -> reader.clientFor(session, handle.remote())
                     .scanPinned(handle.schemaName(), handle.tableName(), handle.snapshotId(), handle.tableUuid()));
 
             HoglakeReadSessionContext context = reader.context();
@@ -755,18 +869,18 @@ final class HoglakeDedicatedReadPath
             // Validate every returned file and deletion vector before emitting any split.
             for (HoglakeDtos.ScanFile file : scanFiles) {
                 if (file == null || file.dataFile() == null) {
-                    throw scope.tableDenied();
+                    throw scope.tableDenied(handle.remote());
                 }
                 HoglakeDtos.DataFile dataFile = file.dataFile();
-                scope.requireLocation(context, dataFile.path());
+                scope.requireLocation(context, dataFile.path(), handle.remote());
                 if (dataFile.fileSizeBytes() < 0) {
-                    throw scope.tableDenied();
+                    throw scope.tableDenied(handle.remote());
                 }
                 HoglakeDtos.DeleteFile deleteFile = file.deleteFile();
                 if (deleteFile != null) {
-                    scope.requireLocation(context, deleteFile.path());
+                    scope.requireLocation(context, deleteFile.path(), handle.remote());
                     if (deleteFile.dataFileId() != dataFile.dataFileId()) {
-                        throw scope.tableDenied();
+                        throw scope.tableDenied(handle.remote());
                     }
                 }
             }
@@ -800,14 +914,13 @@ final class HoglakeDedicatedReadPath
         public boolean schemaExists(ConnectorSession session, String schemaName)
         {
             Reader reader = reader(session, transaction);
-            if (schemaName == null || !schemaName.equals(schemaName.toLowerCase(ENGLISH))) {
+            Optional<Boolean> remote = scope.resolveRemote(schemaName, reader.context());
+            if (remote.isEmpty()) {
                 return false;
             }
-            if (scope.remote() && !schemaName.equals(scope.teamSchema(reader.context()))) {
-                return false;
-            }
-            return discover(() -> reader.clientFor(session).findNamespace(schemaName))
-                    .filter(namespace -> schemaName.equals(namespace.name()) && namespace.isRemote() == scope.remote())
+            boolean isRemote = remote.orElseThrow();
+            return discover(() -> reader.clientFor(session, isRemote).findNamespace(schemaName))
+                    .filter(namespace -> schemaName.equals(namespace.name()) && namespace.isRemote() == isRemote)
                     .isPresent();
         }
 
@@ -815,10 +928,10 @@ final class HoglakeDedicatedReadPath
         public List<String> listSchemaNames(ConnectorSession session)
         {
             Reader reader = reader(session, transaction);
-            if (!scope.remote()) {
+            if (!scope.supportsRemote()) {
                 throw scope.listingDenied();
             }
-            // The one schema this session can read. The catalog's other schemas are not listed to it.
+            // The one remote schema this session can read. Other schemas are not listed to it.
             String teamSchema = scope.teamSchema(reader.context());
             return schemaExists(session, teamSchema) ? ImmutableList.of(teamSchema) : ImmutableList.of();
         }
@@ -827,14 +940,14 @@ final class HoglakeDedicatedReadPath
         public List<SchemaTableName> listTables(ConnectorSession session, Optional<String> schemaName)
         {
             Reader reader = reader(session, transaction);
-            if (!scope.remote()) {
+            if (!scope.supportsRemote()) {
                 throw scope.listingDenied();
             }
             String teamSchema = scope.teamSchema(reader.context());
             if ((schemaName.isPresent() && !schemaName.get().equals(teamSchema)) || !schemaExists(session, teamSchema)) {
                 return ImmutableList.of();
             }
-            return discover(() -> reader.clientFor(session).listTables(teamSchema)).stream()
+            return discover(() -> reader.clientFor(session, true).listTables(teamSchema)).stream()
                     .filter(table -> table != null && table.name() != null && !table.name().isBlank())
                     .map(table -> new SchemaTableName(teamSchema, table.name()))
                     .collect(toImmutableList());
@@ -849,30 +962,33 @@ final class HoglakeDedicatedReadPath
         {
             Reader reader = reader(session, transaction);
             if (startVersion.isPresent() || endVersion.isPresent()) {
-                throw new TrinoException(NOT_SUPPORTED, scope.remote()
+                throw new TrinoException(NOT_SUPPORTED, scope.supportsRemote()
                         ? "Table versioning is not supported by a Hoglake read session"
                         : "Table versioning is not supported by dedicated Hoglake local read");
             }
-            if (scope.remote() && !tableName.getSchemaName().equals(scope.teamSchema(reader.context()))) {
+            Optional<Boolean> remote = scope.resolveRemote(tableName.getSchemaName(), reader.context());
+            if (remote.isEmpty()) {
                 return null;
             }
+            boolean isRemote = remote.orElseThrow();
             HoglakeTableHandle cached = reader.pinnedTables().get(tableName);
             if (cached != null) {
                 return cached;
             }
-            // The engine resolves a table without asking for its schema first. The server must
-            // answer the namespace itself as remote before any table of it is pinned.
-            if (scope.remote() && !schemaExists(session, tableName.getSchemaName())) {
+            // The engine resolves a table without asking for its schema first. In remote and
+            // combined modes the server must answer the namespace itself with the expected
+            // locality before any table of it is pinned.
+            if ((isRemote || scope.mode() == Scope.Mode.COMBINED) && !schemaExists(session, tableName.getSchemaName())) {
                 return null;
             }
-            Optional<HoglakeDtos.Table> found = discover(() -> reader.clientFor(session)
+            Optional<HoglakeDtos.Table> found = discover(() -> reader.clientFor(session, isRemote)
                     .getTable(tableName.getSchemaName(), tableName.getTableName()));
             if (found.isEmpty()) {
                 return null;
             }
             HoglakeDtos.Table table = found.get();
-            if (table.isRemote() != scope.remote()) {
-                throw scope.tableDenied();
+            if (table.isRemote() != isRemote) {
+                throw scope.tableDenied(isRemote);
             }
             if (!tableName.getSchemaName().equals(table.namespace())
                     || !tableName.getTableName().equals(table.name())
@@ -881,7 +997,7 @@ final class HoglakeDedicatedReadPath
                     || table.readSnapshotId() < 0
                     || table.columns() == null
                     || table.columns().isEmpty()) {
-                throw scope.tableDenied();
+                throw scope.tableDenied(isRemote);
             }
 
             List<HoglakeColumnHandle> columns = table.columns().stream()
@@ -889,7 +1005,7 @@ final class HoglakeDedicatedReadPath
                     .collect(toImmutableList());
             if (columns.stream().anyMatch(column -> column.name() == null || column.name().isBlank())
                     || columns.stream().map(HoglakeColumnHandle::name).distinct().count() != columns.size()) {
-                throw scope.tableDenied();
+                throw scope.tableDenied(isRemote);
             }
             HoglakeTableHandle handle = new HoglakeTableHandle(
                     tableName.getSchemaName(),
@@ -902,7 +1018,7 @@ final class HoglakeDedicatedReadPath
                     ImmutableList.of(),
                     false,
                     OptionalLong.empty(),
-                    scope.remote());
+                    isRemote);
             HoglakeTableHandle existing = reader.pinnedTables().putIfAbsent(tableName, handle);
             return existing != null ? existing : handle;
         }
@@ -1092,7 +1208,7 @@ final class HoglakeDedicatedReadPath
                 UnaryOperator<Set<SchemaTableName>> relationFilter)
         {
             Reader reader = reader(session, transaction);
-            if (!scope.remote()) {
+            if (!scope.supportsRemote()) {
                 throw scope.listingDenied();
             }
             // The columns of the session's own team schema, each from the table's pinned handle
@@ -1117,7 +1233,7 @@ final class HoglakeDedicatedReadPath
                 UnaryOperator<Set<SchemaTableName>> relationFilter)
         {
             reader(session, transaction);
-            if (scope.remote()) {
+            if (scope.supportsRemote()) {
                 // No comment is read on this path
                 return ImmutableList.<RelationCommentMetadata>of().iterator();
             }
@@ -1447,12 +1563,12 @@ final class HoglakeDedicatedReadPath
             HoglakeReadSessionContext context = verifier.verify(session);
             HoglakeTableHandle handle = scope.validate(table, context);
             if (!(split instanceof HoglakeSplit hoglakeSplit)) {
-                throw scope.tableDenied();
+                throw scope.tableDenied(handle.remote());
             }
 
-            scope.requireLocation(context, hoglakeSplit.path());
+            scope.requireLocation(context, hoglakeSplit.path(), handle.remote());
             if (hoglakeSplit.deleteFilePath().isPresent()) {
-                scope.requireLocation(context, hoglakeSplit.deleteFilePath().orElseThrow());
+                scope.requireLocation(context, hoglakeSplit.deleteFilePath().orElseThrow(), handle.remote());
             }
 
             HoglakeSplit localSplit = stripMetadataCount(hoglakeSplit);
@@ -1595,7 +1711,7 @@ final class HoglakeDedicatedReadPath
             if (location == null) {
                 throw targetDenied();
             }
-            scope.requireLocation(context, location.toString());
+            scope.requireAnyConfiguredLocation(context, location.toString());
         }
 
         @Override
