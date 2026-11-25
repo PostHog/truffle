@@ -112,7 +112,17 @@ final class HoglakeSharedSessionContext
      */
     public boolean isTeamSchemaOutsideGrant(String schemaName)
     {
-        return storage.isPresent() && isTeamSchema(schemaName) && !holdsTeam(schemaName);
+        return storage.isPresent() && holdsNoTeamSchema(schemaName);
+    }
+
+    /**
+     * Whether the name is a canonical team schema that this token does not hold,
+     * whether or not it carries the profile. Nothing is ever asked of the server for
+     * such a schema: for this caller it does not exist.
+     */
+    public boolean holdsNoTeamSchema(String schemaName)
+    {
+        return isTeamSchema(schemaName) && !holdsTeam(schemaName);
     }
 
     private static boolean isTeamSchema(String schemaName)

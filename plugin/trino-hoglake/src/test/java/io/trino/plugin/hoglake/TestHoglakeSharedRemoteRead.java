@@ -374,8 +374,9 @@ final class TestHoglakeSharedRemoteRead
             // A team schema the server does not call remote: asked once, then refused
             // before this catalog's snapshot or any table of it is requested
             fixture.requests.clear();
-            assertThatThrownBy(() -> runner.execute(session, "SELECT * FROM hoglake.team_9.events"))
-                    .isInstanceOf(QueryFailedException.class);
+            assertTrinoExceptionThrownBy(() -> runner.execute(session, "SELECT * FROM hoglake.team_9.events"))
+                    .hasErrorCode(NOT_SUPPORTED)
+                    .hasMessageContaining(READS_REMOTE_ONLY);
             assertThat(fixture.requests.stream().map(Request::target).collect(toImmutableList()))
                     .containsExactly(CATALOG_PATH + "/namespaces/team_9");
 
@@ -457,8 +458,8 @@ final class TestHoglakeSharedRemoteRead
             // after that one request: the name never makes a schema remote
             fixture.requests.clear();
             assertTrinoExceptionThrownBy(() -> runner.execute(session, "SELECT count(*) FROM hoglake.team_9.events"))
-                    .hasErrorCode(PERMISSION_DENIED)
-                    .hasMessageContaining("Shared Hoglake session authority does not allow this read");
+                    .hasErrorCode(NOT_SUPPORTED)
+                    .hasMessageContaining(READS_REMOTE_ONLY);
             assertThat(fixture.requests).extracting(Request::target).containsExactly(CATALOG_PATH + "/namespaces/team_9");
 
             // A remote team schema still reads
@@ -504,9 +505,15 @@ final class TestHoglakeSharedRemoteRead
                 assertThat(fixture.requests).isEmpty();
             }
 
-            // So does time travel on a team the token does not hold, with no request
+            // Time travel on a team the token does not hold answers as on a schema that
+            // does not exist, with no request
             fixture.requests.clear();
             assertTrinoExceptionThrownBy(() -> runner.execute(session, "SELECT count(*) FROM hoglake.team_4243.events FOR VERSION AS OF 1"))
+                    .hasErrorCode(SCHEMA_NOT_FOUND)
+                    .hasMessageContaining("Schema 'team_4243' does not exist");
+            assertThat(fixture.requests).isEmpty();
+            // On a held team it is still refused before any request
+            assertTrinoExceptionThrownBy(() -> runner.execute(session, "SELECT count(*) FROM hoglake.team_7.events FOR VERSION AS OF 1"))
                     .hasErrorCode(NOT_SUPPORTED);
             assertThat(fixture.requests).isEmpty();
 
@@ -550,6 +557,112 @@ final class TestHoglakeSharedRemoteRead
                     CATALOG_PATH + "/namespaces/team_7",
                     CATALOG_PATH + "/namespaces/team_7/tables/missing",
                     CATALOG_PATH + "/namespaces/team_7");
+        }
+    }
+
+    @Test
+    void testInformationSchemaAsksNothingForATeamTheTokenDoesNotHold()
+            throws Exception
+    {
+        try (Fixture fixture = new Fixture(directory);
+                StandaloneQueryRunner runner = fixture.queryRunner(true)) {
+            // A token that holds team 7 only
+            Map<String, Object> claims = profileClaims(Instant.now());
+            claims.put("prd", new LinkedHashMap<>(Map.of("team_id", new LinkedHashMap<>(Map.of("7", "read")))));
+            Session session = querySession(token(fixture.key, KEY_ID, claims));
+
+            // Filtered to a team the token does not hold: no rows, as for a schema that
+            // does not exist, and no request
+            for (String table : List.of("tables", "columns")) {
+                fixture.requests.clear();
+                assertThat(runner.execute(session, "SELECT * FROM hoglake.information_schema.%s WHERE table_schema = 'team_4243'".formatted(table)).getRowCount())
+                        .as(table)
+                        .isZero();
+                assertThat(fixture.requests).as(table).isEmpty();
+            }
+
+            // Unfiltered: the caller's own listing, then the tables of what it lists (the
+            // fake's schemas have no tables)
+            fixture.requests.clear();
+            assertThat(runner.execute(session, "SELECT DISTINCT table_schema FROM hoglake.information_schema.tables").getOnlyColumnAsSet())
+                    .containsExactly("information_schema");
+            assertThat(fixture.requests).extracting(Request::target).containsExactlyInAnyOrder(
+                    CATALOG_PATH + "/namespaces",
+                    CATALOG_PATH + "/namespaces/ns1/tables",
+                    CATALOG_PATH + "/namespaces/team_7/tables");
+
+            // A server that wrongly lists a team the token does not hold: the team is
+            // dropped from the listing, and nothing is asked for it
+            fixture.listsUnheldTeam = true;
+            fixture.requests.clear();
+            assertThat(runner.execute(session, "SHOW SCHEMAS FROM hoglake").getOnlyColumnAsSet())
+                    .containsExactlyInAnyOrder("information_schema", "ns1", "team_7");
+            assertThat(runner.execute(session, "SELECT schema_name FROM hoglake.information_schema.schemata").getOnlyColumnAsSet())
+                    .containsExactlyInAnyOrder("information_schema", "ns1", "team_7");
+            assertThat(runner.execute(session, "SELECT DISTINCT table_schema FROM hoglake.information_schema.tables").getOnlyColumnAsSet())
+                    .containsExactly("information_schema");
+            assertThat(runner.execute(session, "SELECT DISTINCT table_schema FROM hoglake.information_schema.columns").getOnlyColumnAsSet())
+                    .containsExactly("information_schema");
+            assertThat(fixture.requests).extracting(Request::path)
+                    .noneMatch(path -> path.contains("team_4243"))
+                    .allSatisfy(path -> assertThat(path).isIn(
+                            CATALOG_PATH + "/namespaces",
+                            CATALOG_PATH + "/namespaces/ns1/tables",
+                            CATALOG_PATH + "/namespaces/team_7/tables"));
+        }
+    }
+
+    @Test
+    void testATokenWithoutTheProfileAsksNothingForATeamItDoesNotHold()
+            throws Exception
+    {
+        for (boolean remoteRead : List.of(true, false)) {
+            try (Fixture fixture = new Fixture(directory);
+                    StandaloneQueryRunner runner = fixture.queryRunner(remoteRead, true)) {
+                // A metadata token that holds team 7, on a catalog that checks a schema by name
+                Session session = querySession(fixture.plainToken());
+                assertTrinoExceptionThrownBy(() -> runner.execute(session, "SHOW TABLES FROM hoglake.team_4243"))
+                        .hasErrorCode(SCHEMA_NOT_FOUND)
+                        .hasMessageContaining("Schema 'team_4243' does not exist");
+                assertThat(runner.execute(session, "SELECT * FROM hoglake.information_schema.tables WHERE table_schema = 'team_4243'").getRowCount()).isZero();
+                assertThat(fixture.requests).as("remote read %s", remoteRead).isEmpty();
+
+                // A held team is still checked by name
+                assertThat(runner.execute(session, "SHOW TABLES FROM hoglake.team_7").getRowCount()).isZero();
+                assertThat(fixture.requests).extracting(Request::target).containsExactly(
+                        CATALOG_PATH + "/namespaces/team_7",
+                        CATALOG_PATH + "/namespaces/team_7/tables");
+            }
+        }
+    }
+
+    @Test
+    void testWritesToATeamTheTokenDoesNotHoldFindNoTable()
+            throws Exception
+    {
+        try (Fixture fixture = new Fixture(directory);
+                StandaloneQueryRunner runner = fixture.queryRunner(true)) {
+            // A token that holds team 7 only
+            Map<String, Object> claims = profileClaims(Instant.now());
+            claims.put("prd", new LinkedHashMap<>(Map.of("team_id", new LinkedHashMap<>(Map.of("7", "read")))));
+            Session session = querySession(token(fixture.key, KEY_ID, claims));
+
+            // As for a table that does not exist, with no request
+            assertTrinoExceptionThrownBy(() -> runner.execute(session, "INSERT INTO hoglake.team_4243.x VALUES (1)"))
+                    .hasErrorCode(TABLE_NOT_FOUND)
+                    .hasMessageContaining("Table 'hoglake.team_4243.x' does not exist");
+            assertThat(runner.execute(session, "DROP TABLE IF EXISTS hoglake.team_4243.x").getRowCount()).isZero();
+            assertThat(fixture.requests).isEmpty();
+
+            // A held team's table is still refused, and nothing that changes it is sent
+            assertTrinoExceptionThrownBy(() -> runner.execute(session, "INSERT INTO hoglake.team_7.events VALUES (1)"))
+                    .hasErrorCode(NOT_SUPPORTED);
+            assertTrinoExceptionThrownBy(() -> runner.execute(session, "DROP TABLE IF EXISTS hoglake.team_7.events"))
+                    .hasErrorCode(NOT_SUPPORTED);
+            assertThat(fixture.requests).isNotEmpty().allSatisfy(request -> {
+                assertThat(request.method()).isEqualTo("GET");
+                assertThat(request.path()).startsWith(CATALOG_PATH + "/namespaces/team_7");
+            });
         }
     }
 
@@ -759,6 +872,8 @@ final class TestHoglakeSharedRemoteRead
         private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
         private final List<Request> requests = new CopyOnWriteArrayList<>();
         private final AtomicReference<String> unexpected = new AtomicReference<>();
+        // A server that wrongly lists a team schema no caller here holds
+        private volatile boolean listsUnheldTeam;
 
         public Fixture(Path directory)
                 throws IOException
@@ -856,6 +971,9 @@ final class TestHoglakeSharedRemoteRead
             if (!request.method().equals("GET")) {
                 unexpected.compareAndSet(null, request.method() + " " + request.target());
                 return null;
+            }
+            if (request.path().equals(namespaces) && listsUnheldTeam) {
+                return "[{\"name\":\"ns1\",\"namespace_id\":1},{\"name\":\"team_7\",\"remote\":true},{\"name\":\"team_4243\",\"remote\":true}]";
             }
             if (request.path().equals(namespaces) && !namesTeam7(request.authorization())) {
                 // As the server, list a team schema only to a token that names the team: a

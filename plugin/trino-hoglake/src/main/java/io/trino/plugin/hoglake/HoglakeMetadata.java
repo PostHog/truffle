@@ -234,7 +234,7 @@ public class HoglakeMetadata
      * Whether the server says the schema is remote: served by another Hoglake through
      * this catalog's server, with snapshots of its own. Never inferred from the name.
      */
-    private boolean isRemoteSchema(String schemaName)
+    boolean isRemoteSchema(String schemaName)
     {
         return namespace(schemaName).map(HoglakeDtos.Namespace::isRemote).orElse(false);
     }
