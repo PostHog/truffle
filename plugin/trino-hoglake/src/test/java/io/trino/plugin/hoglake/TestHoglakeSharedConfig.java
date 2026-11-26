@@ -48,7 +48,8 @@ class TestHoglakeSharedConfig
                 .setScopedMaxLifetime(new Duration(900, SECONDS))
                 .setReadSessionProfile(null)
                 .setReadSessionRemoteTargets(ImmutableSet.of())
-                .setReadSessionLocalRead(false));
+                .setReadSessionLocalRead(false)
+                .setWriteSessionLocalWrite(false));
     }
 
     @Test
@@ -68,6 +69,7 @@ class TestHoglakeSharedConfig
                         .put("hoglake.shared.read-session-profile", "example.aws-session")
                         .put("hoglake.shared.read-session-remote-targets", "remote:events,remote:imports")
                         .put("hoglake.shared.read-session-local-read", "true")
+                        .put("hoglake.shared.write-session-local-write", "true")
                         .buildOrThrow(),
                 new HoglakeSharedConfig()
                         .setUri(URI.create("https://metadata.example.test"))
@@ -82,7 +84,8 @@ class TestHoglakeSharedConfig
                         .setScopedMaxLifetime(new Duration(600, SECONDS))
                         .setReadSessionProfile("example.aws-session")
                         .setReadSessionRemoteTargets(ImmutableSet.of("remote:events", "remote:imports"))
-                        .setReadSessionLocalRead(true));
+                        .setReadSessionLocalRead(true)
+                        .setWriteSessionLocalWrite(true));
     }
 
     @Test

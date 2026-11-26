@@ -45,11 +45,18 @@ final class HoglakeDeletePublisher
 {
     private final HoglakeClient client;
     private final TrinoFileSystem fileSystem;
+    private final Consumer<HoglakeDtos.ScanFile> scanFileValidator;
 
     HoglakeDeletePublisher(HoglakeClient client, TrinoFileSystem fileSystem)
     {
+        this(client, fileSystem, _ -> {});
+    }
+
+    HoglakeDeletePublisher(HoglakeClient client, TrinoFileSystem fileSystem, Consumer<HoglakeDtos.ScanFile> scanFileValidator)
+    {
         this.client = client;
         this.fileSystem = fileSystem;
+        this.scanFileValidator = scanFileValidator;
     }
 
     private static void checkCancelled()
@@ -96,7 +103,13 @@ final class HoglakeDeletePublisher
         HoglakeTableHandle table = handle.table();
         Map<Long, HoglakeDeleteBitmap> changes = new TreeMap<>();
         Map<String, HoglakeDtos.FileRegistration> appends = new TreeMap<>();
-        Map<Long, HoglakeDtos.ScanFile> files = HoglakeSplitManager.scan(client, table).stream()
+        List<HoglakeDtos.ScanFile> scanFiles = client.isLocalOnly()
+                ? client.scanPinned(table.schemaName(), table.tableName(), table.snapshotId(), table.tableUuid())
+                : HoglakeSplitManager.scan(client, table);
+        for (HoglakeDtos.ScanFile scanFile : scanFiles) {
+            scanFileValidator.accept(scanFile);
+        }
+        Map<Long, HoglakeDtos.ScanFile> files = scanFiles.stream()
                 .collect(toMap(file -> file.dataFile().dataFileId(), file -> file));
         long lastRenewal = System.nanoTime();
         long fragmentBytes = 0;
@@ -200,7 +213,7 @@ final class HoglakeDeletePublisher
                     try {
                         fileSystem.deleteFile(upload);
                     }
-                    catch (IOException cleanupFailure) {
+                    catch (IOException | RuntimeException cleanupFailure) {
                         failure.addSuppressed(cleanupFailure);
                     }
                 }

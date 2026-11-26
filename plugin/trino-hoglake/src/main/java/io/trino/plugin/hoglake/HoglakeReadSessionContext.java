@@ -17,6 +17,7 @@ import com.google.common.collect.ImmutableList;
 import io.trino.spi.TrinoException;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
@@ -48,6 +49,7 @@ final class HoglakeReadSessionContext
     private final Placement placement;
     private final StorageSession storage;
     private final List<StorageGrant> grants;
+    private final boolean writable;
 
     HoglakeReadSessionContext(
             String catalog,
@@ -63,6 +65,24 @@ final class HoglakeReadSessionContext
             StorageSession storage,
             List<StorageGrant> grants)
     {
+        this(catalog, token, principal, user, organization, sessionId, generation, sessionDeadline, teamId, placement, storage, grants, false);
+    }
+
+    HoglakeReadSessionContext(
+            String catalog,
+            String token,
+            String principal,
+            String user,
+            String organization,
+            String sessionId,
+            long generation,
+            long sessionDeadline,
+            long teamId,
+            Placement placement,
+            StorageSession storage,
+            List<StorageGrant> grants,
+            boolean writable)
+    {
         this.catalog = requireNonNull(catalog, "catalog is null");
         this.token = requireNonNull(token, "token is null");
         this.principal = requireNonNull(principal, "principal is null");
@@ -75,6 +95,7 @@ final class HoglakeReadSessionContext
         this.placement = requireNonNull(placement, "placement is null");
         this.storage = requireNonNull(storage, "storage is null");
         this.grants = ImmutableList.copyOf(grants);
+        this.writable = writable;
     }
 
     public String catalog()
@@ -135,6 +156,29 @@ final class HoglakeReadSessionContext
     public List<StorageGrant> grants()
     {
         return grants;
+    }
+
+    public boolean writable()
+    {
+        return writable;
+    }
+
+    public Optional<StorageGrant> primaryWritePrefixGrant()
+    {
+        if (!writable) {
+            return Optional.empty();
+        }
+        return grants.stream()
+                .filter(grant -> grant.catalog().equals(catalog) && grant.target().equals(catalog) && grant.prefix())
+                .findFirst();
+    }
+
+    public void requirePrimaryWriteLocation(String location, String region)
+    {
+        if (!writable) {
+            throw new TrinoException(PERMISSION_DENIED, "Hoglake session is read-only");
+        }
+        requireStorageLocation(catalog, location, region);
     }
 
     /**

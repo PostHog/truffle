@@ -31,6 +31,7 @@ import io.trino.plugin.base.classloader.ClassLoaderSafeConnectorPageSourceProvid
 import io.trino.plugin.base.classloader.ClassLoaderSafeConnectorSplitManager;
 import io.trino.plugin.base.jmx.MBeanServerModule;
 import io.trino.plugin.base.session.SessionPropertiesProvider;
+import io.trino.spi.PageSorter;
 import io.trino.spi.classloader.ThreadContextClassLoader;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorContext;
@@ -77,7 +78,7 @@ public class HoglakeConnectorFactory
                             "io.trino.bootstrap.catalog." + catalogName,
                             new MBeanModule(),
                             new MBeanServerModule(),
-                            new SharedModule(Optional.of(properties.get("s3.region"))),
+                            new SharedModule(Optional.of(properties.get("s3.region")), context.getNodeManager().getCurrentNode().getVersion(), context.getPageSorter()),
                             new FileSystemModule(catalogName, context, false),
                             new ConnectorContextModule(catalogName, context))
                             .doNotInitializeLogging()
@@ -88,7 +89,7 @@ public class HoglakeConnectorFactory
                 }
                 Injector injector = new Bootstrap(
                         "io.trino.bootstrap.catalog." + catalogName,
-                        new SharedModule(Optional.empty()),
+                        new SharedModule(Optional.empty(), context.getNodeManager().getCurrentNode().getVersion(), context.getPageSorter()),
                         new ConnectorContextModule(catalogName, context))
                         .doNotInitializeLogging()
                         .disableSystemProperties()
@@ -161,10 +162,14 @@ public class HoglakeConnectorFactory
             implements Module
     {
         private final Optional<String> storageRegion;
+        private final String trinoVersion;
+        private final PageSorter pageSorter;
 
-        private SharedModule(Optional<String> storageRegion)
+        private SharedModule(Optional<String> storageRegion, String trinoVersion, PageSorter pageSorter)
         {
             this.storageRegion = storageRegion;
+            this.trinoVersion = trinoVersion;
+            this.pageSorter = pageSorter;
         }
 
         @Override
@@ -200,7 +205,8 @@ public class HoglakeConnectorFactory
             Optional<HoglakeDedicatedReadPath> readSessions = Optional.empty();
             if (config.getReadSessionProfile().isPresent() != !config.getReadSessionRemoteTargets().isEmpty()
                     || (config.getReadSessionProfile().isPresent() && storageRegion.isEmpty())
-                    || (config.isReadSessionLocalRead() && config.getReadSessionProfile().isEmpty())) {
+                    || (config.isReadSessionLocalRead() && config.getReadSessionProfile().isEmpty())
+                    || (config.isWriteSessionLocalWrite() && !config.isReadSessionLocalRead())) {
                 throw new IllegalArgumentException("Invalid shared Hoglake read session configuration");
             }
             if (storageRegion.isPresent()) {
@@ -227,7 +233,10 @@ public class HoglakeConnectorFactory
                             Duration.ofNanos(config.getRequestTimeout().roundTo(NANOSECONDS)),
                             readSessionVerifier,
                             fileSystemFactory,
-                            config.getReadSessionRemoteTargets())
+                            config.getReadSessionRemoteTargets(),
+                            config.isWriteSessionLocalWrite(),
+                            trinoVersion,
+                            pageSorter)
                             : HoglakeDedicatedReadPath.forRemoteTeamSchema(
                             config.getUri(),
                             Duration.ofNanos(config.getRequestTimeout().roundTo(NANOSECONDS)),

@@ -386,11 +386,16 @@ final class S3OutputStream
                 .key(location.key())
                 .uploadId(uploadId)
                 .multipartUpload(x -> x.parts(parts))
-                .applyMutation(builder -> key.ifPresentOrElse(
-                        encryption -> builder.sseCustomerKey(encoded(encryption))
-                                .sseCustomerAlgorithm(encryption.algorithm())
-                                .sseCustomerKeyMD5(md5Checksum(encryption)),
-                        () -> setEncryptionSettings(builder, context.s3SseContext())))
+                .applyMutation(builder -> {
+                    if (context.exclusiveCreate()) {
+                        builder.ifNoneMatch("*");
+                    }
+                    key.ifPresentOrElse(
+                            encryption -> builder.sseCustomerKey(encoded(encryption))
+                                    .sseCustomerAlgorithm(encryption.algorithm())
+                                    .sseCustomerKeyMD5(md5Checksum(encryption)),
+                            () -> setEncryptionSettings(builder, context.s3SseContext()));
+                })
                 .build();
 
         client.completeMultipartUpload(request);
@@ -445,7 +450,7 @@ final class S3OutputStream
                 .checksumAlgorithm(toChecksumAlgorithm(context.checksumAlgorithm()))
                 .contentLength((long) dataStreamProvider.size())
                 .applyMutation(builder -> {
-                    if (exclusiveCreate) {
+                    if (exclusiveCreate || context.exclusiveCreate()) {
                         builder.ifNoneMatch("*");
                     }
                     key.ifPresent(encryption -> {

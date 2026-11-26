@@ -53,6 +53,7 @@ import java.util.stream.IntStream;
 import static io.airlift.slice.Slices.wrappedBuffer;
 import static io.trino.plugin.hoglake.HoglakeErrorCode.HOGLAKE_WRITE_ERROR;
 import static io.trino.spi.StandardErrorCode.CONSTRAINT_VIOLATION;
+import static io.trino.spi.StandardErrorCode.PERMISSION_DENIED;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 import static org.apache.parquet.format.CompressionCodec.SNAPPY;
@@ -394,6 +395,12 @@ public class HoglakePageSink
             }
             else {
                 fileSystem.deleteFiles(locations);
+            }
+        }
+        catch (TrinoException e) {
+            // Create-only sessions intentionally lack delete authority; uncommitted files are reaped by catalog GC.
+            if (!PERMISSION_DENIED.toErrorCode().equals(e.getErrorCode())) {
+                throw e;
             }
         }
         catch (IOException e) {

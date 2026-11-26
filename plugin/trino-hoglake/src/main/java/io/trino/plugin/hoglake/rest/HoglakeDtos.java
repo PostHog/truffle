@@ -499,4 +499,44 @@ public final class HoglakeDtos
     public record ScanFile(
             @JsonProperty("data_file") DataFile dataFile,
             @JsonProperty("delete_file") DeleteFile deleteFile) {}
+
+    public record LocalNamespaceList(
+            @JsonProperty("namespaces") List<Namespace> namespaces,
+            @JsonProperty("next_after") String nextAfter) {}
+
+    public record LocalTableList(
+            @JsonProperty("tables") List<TableSummary> tables,
+            @JsonProperty("next_after") String nextAfter) {}
+
+    public record LocalNamespaceMutation(
+            @JsonProperty("namespace_id") Long namespaceId,
+            @JsonProperty("name") String name,
+            @JsonProperty("snapshot_id") Long snapshotId) {}
+
+    public record LocalTableDrop(
+            @JsonProperty("table_uuid") String tableUuid,
+            @JsonProperty("snapshot_id") Long snapshotId) {}
+
+    public record LocalAddFile(
+            @JsonProperty("path") String path,
+            @JsonProperty("file_size_bytes") long fileSizeBytes,
+            @JsonProperty("record_count") long recordCount,
+            @JsonProperty("column_stats_json") String columnStatsJson) {}
+
+    public record LocalAddDv(
+            @JsonProperty("data_file_id") long dataFileId,
+            @JsonProperty("path") String path,
+            @JsonProperty("file_size_bytes") long fileSizeBytes,
+            @JsonProperty("delete_count") long deleteCount) {}
+
+    public record LocalCommitRequest(
+            @JsonProperty("table_uuid") String tableUuid,
+            @JsonProperty("base_snapshot_id") long baseSnapshotId,
+            @JsonProperty("add_files") List<LocalAddFile> addFiles,
+            @JsonProperty("remove_file_ids") List<Long> removeFileIds,
+            @JsonProperty("add_dvs") List<LocalAddDv> addDvs) {}
+
+    public record LocalCommitResponse(
+            @JsonProperty("snapshot_id") Long snapshotId,
+            @JsonProperty("table_uuid") String tableUuid) {}
 }

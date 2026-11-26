@@ -13,6 +13,7 @@
  */
 package io.trino.plugin.hoglake;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
@@ -23,11 +24,13 @@ import io.trino.filesystem.TrinoFileSystem;
 import io.trino.filesystem.TrinoFileSystemFactory;
 import io.trino.filesystem.TrinoInputFile;
 import io.trino.filesystem.TrinoOutputFile;
+import io.trino.plugin.hoglake.HoglakeReadSessionContext.StorageGrant;
 import io.trino.plugin.hoglake.HoglakeReadSessionContext.StorageSession;
 import io.trino.plugin.hoglake.rest.HoglakeClient;
 import io.trino.plugin.hoglake.rest.HoglakeDtos;
 import io.trino.plugin.hoglake.rest.HoglakeTokenSource;
 import io.trino.spi.ErrorCode;
+import io.trino.spi.PageSorter;
 import io.trino.spi.RefreshType;
 import io.trino.spi.SplitWeight;
 import io.trino.spi.TrinoException;
@@ -39,10 +42,14 @@ import io.trino.spi.connector.ColumnMetadata;
 import io.trino.spi.connector.ConnectorAccessControl;
 import io.trino.spi.connector.ConnectorAnalyzeMetadata;
 import io.trino.spi.connector.ConnectorInsertTableHandle;
+import io.trino.spi.connector.ConnectorMergeSink;
 import io.trino.spi.connector.ConnectorMergeTableHandle;
 import io.trino.spi.connector.ConnectorMetadata;
 import io.trino.spi.connector.ConnectorOutputMetadata;
 import io.trino.spi.connector.ConnectorOutputTableHandle;
+import io.trino.spi.connector.ConnectorPageSink;
+import io.trino.spi.connector.ConnectorPageSinkId;
+import io.trino.spi.connector.ConnectorPageSinkProvider;
 import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.connector.ConnectorPageSourceProvider;
 import io.trino.spi.connector.ConnectorPartitioningHandle;
@@ -75,12 +82,15 @@ import io.trino.spi.connector.RetryMode;
 import io.trino.spi.connector.RowChangeParadigm;
 import io.trino.spi.connector.SampleApplicationResult;
 import io.trino.spi.connector.SampleType;
+import io.trino.spi.connector.SaveMode;
+import io.trino.spi.connector.SchemaNotFoundException;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.SchemaTablePrefix;
 import io.trino.spi.connector.SortItem;
 import io.trino.spi.connector.SourcePage;
 import io.trino.spi.connector.TableColumnsMetadata;
 import io.trino.spi.connector.TableFunctionApplicationResult;
+import io.trino.spi.connector.TableNotFoundException;
 import io.trino.spi.connector.TableScanRedirectApplicationResult;
 import io.trino.spi.connector.TopNApplicationResult;
 import io.trino.spi.expression.ConnectorExpression;
@@ -90,9 +100,20 @@ import io.trino.spi.metrics.Metrics;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.security.AccessDeniedException;
 import io.trino.spi.security.ConnectorIdentity;
+import io.trino.spi.security.PrincipalType;
+import io.trino.spi.security.TrinoPrincipal;
 import io.trino.spi.statistics.ComputedStatistics;
 import io.trino.spi.statistics.TableStatistics;
 import io.trino.spi.statistics.TableStatisticsMetadata;
+import io.trino.spi.type.ArrayType;
+import io.trino.spi.type.MapType;
+import io.trino.spi.type.RowType;
+import io.trino.spi.type.TimeType;
+import io.trino.spi.type.TimestampType;
+import io.trino.spi.type.TimestampWithTimeZoneType;
+import io.trino.spi.type.Type;
+import io.trino.spi.type.TypeOperators;
+import io.trino.spi.type.VarcharType;
 
 import java.io.IOException;
 import java.net.URI;
@@ -101,6 +122,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -116,10 +138,16 @@ import java.util.regex.Pattern;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_ACCESS_KEY_PROPERTY;
+import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_EXCLUSIVE_CREATE_PROPERTY;
 import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_SECRET_KEY_PROPERTY;
 import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_SESSION_TOKEN_PROPERTY;
+import static io.trino.spi.StandardErrorCode.ALREADY_EXISTS;
+import static io.trino.spi.StandardErrorCode.CONSTRAINT_VIOLATION;
+import static io.trino.spi.StandardErrorCode.INVALID_COLUMN_REFERENCE;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.trino.spi.StandardErrorCode.PERMISSION_DENIED;
+import static io.trino.spi.StandardErrorCode.TABLE_ALREADY_EXISTS;
+import static java.util.Comparator.comparing;
 import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 
@@ -140,11 +168,16 @@ final class HoglakeDedicatedReadPath
     private static final String DISCOVERY_FAILED = "Hoglake read session metadata request failed";
     private static final String REMOTE_TABLE_DENIED = "Hoglake read session requires a valid pinned table of its own team schema";
     private static final Pattern TEAM_SCHEMA_ANY = Pattern.compile("team_[0-9]+");
+    private static final Pattern LOCAL_TEAM_SCHEMA_ANY = Pattern.compile("local_team_[0-9]+");
+    private static final Pattern NAMESPACES_ROUTE = Pattern.compile("/namespaces");
     private static final Pattern NAMESPACE_ROUTE = Pattern.compile("/namespaces/([^/]+)");
     private static final Pattern TABLES_ROUTE = Pattern.compile("/namespaces/([^/]+)/tables");
     private static final Pattern TABLE_ROUTE = Pattern.compile("/namespaces/([^/]+)/tables/([^/]+)");
     private static final Pattern SCAN_ROUTE = Pattern.compile("/namespaces/([^/]+)/tables/([^/]+)/scan");
+    private static final Pattern COMMIT_ROUTE = Pattern.compile("/namespaces/([^/]+)/tables/([^/]+)/commit");
     private static final Pattern NON_NEGATIVE_INTEGER = Pattern.compile("0|[1-9][0-9]*");
+    private static final Pattern POSITIVE_INTEGER = Pattern.compile("[1-9][0-9]*");
+    private static final ObjectMapper FRAGMENT_MAPPER = new ObjectMapper();
 
     private final HoglakeReadSessionVerifier verifier;
     private final Scope scope;
@@ -155,11 +188,13 @@ final class HoglakeDedicatedReadPath
     private final TrinoFileSystemFactory sessionFileSystems;
     private final ConnectorSplitManager splitManager;
     private final ConnectorPageSourceProvider pageSourceProvider;
+    private final ConnectorPageSinkProvider pageSinkProvider;
     private final Map<ConnectorTransactionHandle, Reader> readers = new ConcurrentHashMap<>();
+    private final Set<ConnectorTransactionHandle> nonAutoCommitTransactions = ConcurrentHashMap.newKeySet();
 
     HoglakeDedicatedReadPath(URI baseUri, Duration requestTimeout, HoglakeReadSessionVerifier verifier, TrinoFileSystemFactory fileSystemFactory)
     {
-        this(baseUri, requestTimeout, verifier, fileSystemFactory, Scope.Mode.LOCAL_ONLY, ImmutableSet.of());
+        this(baseUri, requestTimeout, verifier, fileSystemFactory, Scope.Mode.LOCAL_ONLY, ImmutableSet.of(), false, "unknown", null);
     }
 
     /**
@@ -176,7 +211,7 @@ final class HoglakeDedicatedReadPath
         if (remoteTargets == null || remoteTargets.size() != 2) {
             throw new IllegalArgumentException("Invalid Hoglake read session configuration");
         }
-        return new HoglakeDedicatedReadPath(baseUri, requestTimeout, verifier, fileSystemFactory, Scope.Mode.REMOTE_ONLY, remoteTargets);
+        return new HoglakeDedicatedReadPath(baseUri, requestTimeout, verifier, fileSystemFactory, Scope.Mode.REMOTE_ONLY, remoteTargets, false, "unknown", null);
     }
 
     /**
@@ -191,10 +226,32 @@ final class HoglakeDedicatedReadPath
             TrinoFileSystemFactory fileSystemFactory,
             Set<String> remoteTargets)
     {
+        return forSharedReadSession(baseUri, requestTimeout, verifier, fileSystemFactory, remoteTargets, false, "unknown", null);
+    }
+
+    static HoglakeDedicatedReadPath forSharedReadSession(
+            URI baseUri,
+            Duration requestTimeout,
+            HoglakeReadSessionVerifier verifier,
+            TrinoFileSystemFactory fileSystemFactory,
+            Set<String> remoteTargets,
+            boolean localWrite,
+            String trinoVersion,
+            PageSorter pageSorter)
+    {
         if (remoteTargets == null || remoteTargets.size() != 2) {
             throw new IllegalArgumentException("Invalid Hoglake read session configuration");
         }
-        return new HoglakeDedicatedReadPath(baseUri, requestTimeout, verifier, fileSystemFactory, Scope.Mode.COMBINED, remoteTargets);
+        return new HoglakeDedicatedReadPath(
+                baseUri,
+                requestTimeout,
+                verifier,
+                fileSystemFactory,
+                Scope.Mode.COMBINED,
+                remoteTargets,
+                localWrite,
+                trinoVersion == null ? "unknown" : trinoVersion,
+                pageSorter);
     }
 
     private HoglakeDedicatedReadPath(
@@ -203,9 +260,12 @@ final class HoglakeDedicatedReadPath
             HoglakeReadSessionVerifier verifier,
             TrinoFileSystemFactory fileSystemFactory,
             Scope.Mode mode,
-            Set<String> remoteTargets)
+            Set<String> remoteTargets,
+            boolean localWrite,
+            String trinoVersion,
+            PageSorter pageSorter)
     {
-        this.scope = new Scope(mode, remoteTargets);
+        this.scope = new Scope(mode, remoteTargets, localWrite);
         this.verifier = requireNonNull(verifier, "verifier is null");
         this.baseUri = HoglakeClient.validateBaseUri(requireNonNull(baseUri, "baseUri is null").toASCIIString()).toString();
         String path = URI.create(this.baseUri).getRawPath();
@@ -222,12 +282,31 @@ final class HoglakeDedicatedReadPath
         this.splitManager = new DedicatedSplitManager();
         // Disable footer and data caches so workers never share state across callers.
         this.pageSourceProvider = new DedicatedPageSourceProvider(verifier, new HoglakePageSourceProvider(sessionFileSystems), scope);
+        this.pageSinkProvider = new DedicatedPageSinkProvider(
+                verifier,
+                new HoglakePageSinkProvider(sessionFileSystems, trinoVersion, pageSorter),
+                scope);
+    }
+
+    boolean localWritesEnabled()
+    {
+        return scope.localWrite();
+    }
+
+    void markNonAutoCommit(ConnectorTransactionHandle transaction)
+    {
+        nonAutoCommitTransactions.add(requireNonNull(transaction, "transaction is null"));
     }
 
     ConnectorMetadata metadata(ConnectorSession session, ConnectorTransactionHandle transaction)
     {
+        return metadata(session, transaction, !nonAutoCommitTransactions.contains(transaction));
+    }
+
+    ConnectorMetadata metadata(ConnectorSession session, ConnectorTransactionHandle transaction, boolean autoCommit)
+    {
         reader(session, transaction);
-        return new DedicatedMetadata(transaction);
+        return new DedicatedMetadata(transaction, autoCommit);
     }
 
     ConnectorSplitManager splitManager()
@@ -238,6 +317,11 @@ final class HoglakeDedicatedReadPath
     ConnectorPageSourceProvider pageSourceProvider()
     {
         return pageSourceProvider;
+    }
+
+    ConnectorPageSinkProvider pageSinkProvider()
+    {
+        return pageSinkProvider;
     }
 
     TrinoFileSystemFactory sessionFileSystems()
@@ -298,6 +382,7 @@ final class HoglakeDedicatedReadPath
 
     void end(ConnectorTransactionHandle transaction)
     {
+        nonAutoCommitTransactions.remove(transaction);
         Reader reader = readers.remove(transaction);
         if (reader != null) {
             reader.close();
@@ -335,6 +420,7 @@ final class HoglakeDedicatedReadPath
                 : Optional.empty();
         // Local-only routes: Hoglake reads only the caller's own local warehouse and never relays a
         // remote schema. A missing name is ordinary absence. An answer without the marker is refused.
+        boolean allowWrites = scope.localWrite() && context.writable();
         Optional<HoglakeClient> localClient = scope.supportsLocal()
                 ? Optional.of(new HoglakeClient(
                 baseUri,
@@ -342,7 +428,7 @@ final class HoglakeDedicatedReadPath
                 requestTimeout,
                 new HoglakeTokenSource.Fixed(context.token()),
                 httpClient,
-                createRouteGuard(basePath, context.catalog()),
+                createRouteGuard(basePath, context.catalog(), allowWrites),
                 true))
                 : Optional.empty();
         return new Reader(context.token(), context, remoteClient, localClient, new ConcurrentHashMap<>(), scope);
@@ -398,12 +484,17 @@ final class HoglakeDedicatedReadPath
 
     static HoglakeClient.RouteGuard createRouteGuard(String basePath, String verifiedCatalog)
     {
+        return createRouteGuard(basePath, verifiedCatalog, false);
+    }
+
+    static HoglakeClient.RouteGuard createRouteGuard(String basePath, String verifiedCatalog, boolean allowWrites)
+    {
         requireNonNull(basePath, "basePath is null");
         requireNonNull(verifiedCatalog, "verifiedCatalog is null");
         // Only the local-only routes. An ordinary route, which a remote schema can relay, is denied.
         String catalogPath = basePath + HoglakeClient.LOCAL_ONLY_PREFIX + "/catalogs/" + verifiedCatalog;
         return (method, uri) -> {
-            if (!"GET".equals(method) || uri == null || uri.getRawFragment() != null) {
+            if (uri == null || uri.getRawFragment() != null) {
                 throw requestDenied();
             }
             String rawPath = uri.getRawPath();
@@ -413,32 +504,138 @@ final class HoglakeDedicatedReadPath
             String suffix = rawPath.substring(catalogPath.length());
             String rawQuery = uri.getRawQuery();
 
-            Matcher namespaceMatch = NAMESPACE_ROUTE.matcher(suffix);
-            if (namespaceMatch.matches()) {
-                if (!isValidSegment(namespaceMatch.group(1)) || rawQuery != null) {
-                    throw requestDenied();
+            if ("GET".equals(method)) {
+                if (NAMESPACES_ROUTE.matcher(suffix).matches()) {
+                    if (!isValidOptionalAfterQuery(rawQuery)) {
+                        throw requestDenied();
+                    }
+                    return;
                 }
-                return;
+
+                Matcher namespaceMatch = NAMESPACE_ROUTE.matcher(suffix);
+                if (namespaceMatch.matches()) {
+                    if (!isValidSegment(namespaceMatch.group(1)) || rawQuery != null) {
+                        throw requestDenied();
+                    }
+                    return;
+                }
+
+                Matcher tablesMatch = TABLES_ROUTE.matcher(suffix);
+                if (tablesMatch.matches()) {
+                    if (!isValidSegment(tablesMatch.group(1)) || !isValidOptionalAfterQuery(rawQuery)) {
+                        throw requestDenied();
+                    }
+                    return;
+                }
+
+                Matcher tableMatch = TABLE_ROUTE.matcher(suffix);
+                if (tableMatch.matches()) {
+                    if (!isValidSegment(tableMatch.group(1)) || !isValidSegment(tableMatch.group(2)) || rawQuery != null) {
+                        throw requestDenied();
+                    }
+                    return;
+                }
+
+                Matcher scanMatch = SCAN_ROUTE.matcher(suffix);
+                if (scanMatch.matches()) {
+                    if (!isValidSegment(scanMatch.group(1)) || !isValidSegment(scanMatch.group(2)) || !isValidPinnedScanQuery(rawQuery)) {
+                        throw requestDenied();
+                    }
+                    return;
+                }
+
+                throw requestDenied();
             }
 
-            Matcher tableMatch = TABLE_ROUTE.matcher(suffix);
-            if (tableMatch.matches()) {
-                if (!isValidSegment(tableMatch.group(1)) || !isValidSegment(tableMatch.group(2)) || rawQuery != null) {
-                    throw requestDenied();
-                }
-                return;
+            if (!allowWrites) {
+                throw requestDenied();
             }
 
-            Matcher scanMatch = SCAN_ROUTE.matcher(suffix);
-            if (scanMatch.matches()) {
-                if (!isValidSegment(scanMatch.group(1)) || !isValidSegment(scanMatch.group(2)) || !isValidPinnedScanQuery(rawQuery)) {
-                    throw requestDenied();
+            if ("POST".equals(method)) {
+                if (NAMESPACES_ROUTE.matcher(suffix).matches()) {
+                    if (rawQuery != null) {
+                        throw requestDenied();
+                    }
+                    return;
                 }
-                return;
+                Matcher tablesMatch = TABLES_ROUTE.matcher(suffix);
+                if (tablesMatch.matches()) {
+                    if (!isValidSegment(tablesMatch.group(1)) || rawQuery != null) {
+                        throw requestDenied();
+                    }
+                    return;
+                }
+                Matcher commitMatch = COMMIT_ROUTE.matcher(suffix);
+                if (commitMatch.matches()) {
+                    if (!isValidSegment(commitMatch.group(1)) || !isValidSegment(commitMatch.group(2)) || rawQuery != null) {
+                        throw requestDenied();
+                    }
+                    return;
+                }
+                throw requestDenied();
+            }
+
+            if ("DELETE".equals(method)) {
+                Matcher namespaceMatch = NAMESPACE_ROUTE.matcher(suffix);
+                if (namespaceMatch.matches()) {
+                    if (!isValidSegment(namespaceMatch.group(1)) || !isValidSinglePositiveIntQuery(rawQuery, "namespace_id")) {
+                        throw requestDenied();
+                    }
+                    return;
+                }
+                Matcher tableMatch = TABLE_ROUTE.matcher(suffix);
+                if (tableMatch.matches()) {
+                    if (!isValidSegment(tableMatch.group(1)) || !isValidSegment(tableMatch.group(2)) || !isValidSingleUuidQuery(rawQuery, "table_uuid")) {
+                        throw requestDenied();
+                    }
+                    return;
+                }
+                throw requestDenied();
             }
 
             throw requestDenied();
         };
+    }
+
+    private static boolean isValidOptionalAfterQuery(String rawQuery)
+    {
+        if (rawQuery == null) {
+            return true;
+        }
+        return rawQuery.startsWith("after=") && rawQuery.length() > "after=".length() && !rawQuery.contains("&");
+    }
+
+    private static boolean isValidSinglePositiveIntQuery(String rawQuery, String paramName)
+    {
+        if (rawQuery == null || rawQuery.contains("&")) {
+            return false;
+        }
+        String prefix = paramName + "=";
+        if (!rawQuery.startsWith(prefix)) {
+            return false;
+        }
+        String value = rawQuery.substring(prefix.length());
+        if (!POSITIVE_INTEGER.matcher(value).matches()) {
+            return false;
+        }
+        try {
+            return Long.parseLong(value) > 0;
+        }
+        catch (NumberFormatException _) {
+            return false;
+        }
+    }
+
+    private static boolean isValidSingleUuidQuery(String rawQuery, String paramName)
+    {
+        if (rawQuery == null || rawQuery.contains("&")) {
+            return false;
+        }
+        String prefix = paramName + "=";
+        if (!rawQuery.startsWith(prefix)) {
+            return false;
+        }
+        return isCanonicalUuid(rawQuery.substring(prefix.length()));
     }
 
     private static boolean isValidSegment(String segment)
@@ -532,7 +729,7 @@ final class HoglakeDedicatedReadPath
      * COMBINED serves the session's own team schema on relayed routes and non-reserved schemas on
      * local-only routes, with strict grant isolation and no fallback between them.
      */
-    private record Scope(Mode mode, Set<String> remoteTargets)
+    private record Scope(Mode mode, Set<String> remoteTargets, boolean localWrite)
     {
         enum Mode
         {
@@ -545,6 +742,9 @@ final class HoglakeDedicatedReadPath
         {
             requireNonNull(mode, "mode is null");
             remoteTargets = ImmutableSet.copyOf(requireNonNull(remoteTargets, "remoteTargets is null"));
+            if (localWrite && mode != Mode.COMBINED) {
+                throw new IllegalArgumentException("Local writes require COMBINED shared read-session mode");
+            }
         }
 
         boolean supportsRemote()
@@ -573,7 +773,33 @@ final class HoglakeDedicatedReadPath
                 return false;
             }
             String lower = schemaName.toLowerCase(ENGLISH);
-            return lower.equals("posthog") || TEAM_SCHEMA_ANY.matcher(lower).matches();
+            return lower.equals("posthog") || lower.equals("information_schema") || TEAM_SCHEMA_ANY.matcher(lower).matches();
+        }
+
+        static boolean isProtectedSchema(String schemaName)
+        {
+            if (schemaName == null) {
+                return false;
+            }
+            return LOCAL_TEAM_SCHEMA_ANY.matcher(schemaName.toLowerCase(ENGLISH)).matches();
+        }
+
+        StorageGrant requireLocalWrite(HoglakeReadSessionContext context, String schemaName, boolean schemaLifecycle)
+        {
+            if (!localWrite || !context.writable()) {
+                throw new TrinoException(PERMISSION_DENIED, "Hoglake session does not allow local writes");
+            }
+            if (schemaName == null || schemaName.isBlank() || !schemaName.equals(schemaName.toLowerCase(ENGLISH))) {
+                throw new TrinoException(PERMISSION_DENIED, "Hoglake local write requires a lowercase schema name");
+            }
+            if (isReservedSchema(schemaName)) {
+                throw new TrinoException(PERMISSION_DENIED, "Hoglake reserved schema is read-only");
+            }
+            if (schemaLifecycle && isProtectedSchema(schemaName)) {
+                throw new TrinoException(PERMISSION_DENIED, "Hoglake default team schema cannot be created or dropped");
+            }
+            return context.primaryWritePrefixGrant()
+                    .orElseThrow(() -> new TrinoException(PERMISSION_DENIED, "Hoglake session has no writable primary storage prefix"));
         }
 
         Optional<Boolean> resolveRemote(String schemaName, HoglakeReadSessionContext context)
@@ -895,10 +1121,65 @@ final class HoglakeDedicatedReadPath
             implements ConnectorMetadata
     {
         private final ConnectorTransactionHandle transaction;
+        private final boolean autoCommit;
 
-        private DedicatedMetadata(ConnectorTransactionHandle transaction)
+        private DedicatedMetadata(ConnectorTransactionHandle transaction, boolean autoCommit)
         {
             this.transaction = requireNonNull(transaction, "transaction is null");
+            this.autoCommit = autoCommit;
+        }
+
+        private void requireAutocommit()
+        {
+            if (!autoCommit) {
+                throw new TrinoException(NOT_SUPPORTED, "Hoglake local writes require autocommit mode");
+            }
+        }
+
+        private boolean canWriteLocal(HoglakeReadSessionContext context, String schemaName)
+        {
+            if (!scope.localWrite()) {
+                return false;
+            }
+            try {
+                scope.requireLocalWrite(context, schemaName, false);
+                return true;
+            }
+            catch (TrinoException ignored) {
+                return false;
+            }
+        }
+
+        @Override
+        public Optional<Type> getSupportedType(ConnectorSession session, Map<String, Object> properties, Type type)
+        {
+            if (type instanceof ArrayType array) {
+                return Optional.of(new ArrayType(getSupportedType(session, properties, array.getElementType()).orElse(array.getElementType())));
+            }
+            if (type instanceof MapType map) {
+                return Optional.of(new MapType(
+                        getSupportedType(session, properties, map.getKeyType()).orElse(map.getKeyType()),
+                        getSupportedType(session, properties, map.getValueType()).orElse(map.getValueType()),
+                        new TypeOperators()));
+            }
+            if (type instanceof RowType row) {
+                return Optional.of(RowType.from(row.getFields().stream()
+                        .map(field -> new RowType.Field(field.getName(), getSupportedType(session, properties, field.getType()).orElse(field.getType())))
+                        .toList()));
+            }
+            if (type instanceof VarcharType) {
+                return Optional.of(VarcharType.VARCHAR);
+            }
+            if (type instanceof TimeType time && time.getPrecision() <= 6) {
+                return Optional.of(TimeType.TIME_MICROS);
+            }
+            if (type instanceof TimestampType timestamp && timestamp.getPrecision() <= 9) {
+                return Optional.of(timestamp.getPrecision() <= 6 ? TimestampType.TIMESTAMP_MICROS : TimestampType.TIMESTAMP_NANOS);
+            }
+            if (type instanceof TimestampWithTimeZoneType timestamp && timestamp.getPrecision() <= 6) {
+                return Optional.of(TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS);
+            }
+            return Optional.empty();
         }
 
         @Override
@@ -922,9 +1203,24 @@ final class HoglakeDedicatedReadPath
             if (!scope.supportsRemote()) {
                 throw scope.listingDenied();
             }
-            // The one remote schema this session can read. Other schemas are not listed to it.
+            Set<String> schemas = new LinkedHashSet<>();
             String teamSchema = scope.teamSchema(reader.context());
-            return schemaExists(session, teamSchema) ? ImmutableList.of(teamSchema) : ImmutableList.of();
+            if (schemaExists(session, teamSchema)) {
+                schemas.add(teamSchema);
+            }
+            if (scope.localWrite() && scope.supportsLocal()) {
+                for (HoglakeDtos.Namespace namespace : discover(() -> reader.clientFor(session, false).listLocalNamespaces())) {
+                    if (namespace != null
+                            && !namespace.isRemote()
+                            && namespace.name() != null
+                            && !namespace.name().isBlank()
+                            && namespace.name().equals(namespace.name().toLowerCase(ENGLISH))
+                            && !Scope.isReservedSchema(namespace.name())) {
+                        schemas.add(namespace.name());
+                    }
+                }
+            }
+            return ImmutableList.copyOf(schemas);
         }
 
         @Override
@@ -935,13 +1231,53 @@ final class HoglakeDedicatedReadPath
                 throw scope.listingDenied();
             }
             String teamSchema = scope.teamSchema(reader.context());
-            if ((schemaName.isPresent() && !schemaName.get().equals(teamSchema)) || !schemaExists(session, teamSchema)) {
-                return ImmutableList.of();
+            if (schemaName.isPresent()) {
+                String requested = schemaName.get();
+                if (requested.equals(teamSchema)) {
+                    if (!schemaExists(session, teamSchema)) {
+                        return ImmutableList.of();
+                    }
+                    return discover(() -> reader.clientFor(session, true).listTables(teamSchema)).stream()
+                            .filter(table -> table != null && table.name() != null && !table.name().isBlank())
+                            .map(table -> new SchemaTableName(teamSchema, table.name()))
+                            .collect(toImmutableList());
+                }
+                if (!scope.localWrite()
+                        || !scope.supportsLocal()
+                        || !requested.equals(requested.toLowerCase(ENGLISH))
+                        || Scope.isReservedSchema(requested)) {
+                    return ImmutableList.of();
+                }
+                return discover(() -> reader.clientFor(session, false).listLocalTables(requested)).stream()
+                        .filter(table -> table != null && table.name() != null && !table.name().isBlank())
+                        .map(table -> new SchemaTableName(requested, table.name()))
+                        .collect(toImmutableList());
             }
-            return discover(() -> reader.clientFor(session, true).listTables(teamSchema)).stream()
-                    .filter(table -> table != null && table.name() != null && !table.name().isBlank())
-                    .map(table -> new SchemaTableName(teamSchema, table.name()))
-                    .collect(toImmutableList());
+            ImmutableList.Builder<SchemaTableName> tables = ImmutableList.builder();
+            if (schemaExists(session, teamSchema)) {
+                discover(() -> reader.clientFor(session, true).listTables(teamSchema)).stream()
+                        .filter(table -> table != null && table.name() != null && !table.name().isBlank())
+                        .map(table -> new SchemaTableName(teamSchema, table.name()))
+                        .forEach(tables::add);
+            }
+            if (scope.localWrite() && scope.supportsLocal()) {
+                for (HoglakeDtos.Namespace namespace : discover(() -> reader.clientFor(session, false).listLocalNamespaces())) {
+                    if (namespace == null
+                            || namespace.isRemote()
+                            || namespace.name() == null
+                            || namespace.name().isBlank()
+                            || !namespace.name().equals(namespace.name().toLowerCase(ENGLISH))
+                            || Scope.isReservedSchema(namespace.name())) {
+                        continue;
+                    }
+                    String localSchema = namespace.name();
+                    discover(() -> reader.clientFor(session, false).listLocalTables(localSchema)).stream()
+                            .filter(table -> table != null && table.name() != null && !table.name().isBlank())
+                            .map(table -> new SchemaTableName(localSchema, table.name()))
+                            .forEach(tables::add);
+                }
+            }
+            return tables.build();
         }
 
         @Override
@@ -1206,7 +1542,11 @@ final class HoglakeDedicatedReadPath
             Set<SchemaTableName> tables = relationFilter.apply(ImmutableSet.copyOf(listTables(session, schemaName)));
             ImmutableList.Builder<RelationColumnsMetadata> relations = ImmutableList.builder();
             for (SchemaTableName name : tables) {
-                if (!name.getSchemaName().equals(scope.teamSchema(reader.context()))) {
+                boolean allowed = name.getSchemaName().equals(scope.teamSchema(reader.context()))
+                        || (scope.localWrite() && scope.supportsLocal()
+                        && name.getSchemaName().equals(name.getSchemaName().toLowerCase(ENGLISH))
+                        && !Scope.isReservedSchema(name.getSchemaName()));
+                if (!allowed) {
                     continue;
                 }
                 ConnectorTableHandle handle = getTableHandle(session, name, Optional.empty(), Optional.empty());
@@ -1321,22 +1661,111 @@ final class HoglakeDedicatedReadPath
         @Override
         public Optional<ConnectorTableLayout> getNewTableLayout(ConnectorSession session, ConnectorTableMetadata tableMetadata)
         {
-            reader(session, transaction);
-            throw writeDenied();
+            Reader reader = reader(session, transaction);
+            scope.requireLocalWrite(reader.context(), tableMetadata.getTable().getSchemaName(), false);
+            return Optional.empty();
         }
 
         @Override
         public Optional<ConnectorTableLayout> getInsertLayout(ConnectorSession session, ConnectorTableHandle tableHandle)
         {
-            reader(session, transaction);
-            throw writeDenied();
+            Reader reader = reader(session, transaction);
+            HoglakeTableHandle handle = validateLocalTableHandle(tableHandle, reader);
+            if (handle.remote()) {
+                throw new TrinoException(PERMISSION_DENIED, "Hoglake remote table is read-only");
+            }
+            scope.requireLocalWrite(reader.context(), handle.schemaName(), false);
+            return Optional.empty();
+        }
+
+        @Override
+        public void createSchema(ConnectorSession session, String schemaName, Map<String, Object> properties, TrinoPrincipal owner)
+        {
+            Reader reader = reader(session, transaction);
+            scope.requireLocalWrite(reader.context(), schemaName, true);
+            requireAutocommit();
+            if (!properties.isEmpty() || (owner != null && (owner.getType() != PrincipalType.USER || !owner.getPrincipalName().equals(session.getUser())))) {
+                throw new TrinoException(NOT_SUPPORTED, "Hoglake local schema properties and custom owners are not supported");
+            }
+            discover(() -> {
+                reader.clientFor(session, false).createLocalNamespace(schemaName);
+                return null;
+            });
+        }
+
+        @Override
+        public void dropSchema(ConnectorSession session, String schemaName, boolean cascade)
+        {
+            Reader reader = reader(session, transaction);
+            scope.requireLocalWrite(reader.context(), schemaName, true);
+            requireAutocommit();
+            if (cascade) {
+                throw new TrinoException(NOT_SUPPORTED, "DROP SCHEMA CASCADE is not supported by Hoglake local writes");
+            }
+            HoglakeClient localClient = reader.clientFor(session, false);
+            HoglakeDtos.Namespace namespace = discover(() -> localClient.findNamespace(schemaName))
+                    .filter(ns -> !ns.isRemote() && schemaName.equals(ns.name()) && ns.namespaceId() != null)
+                    .orElseThrow(() -> new SchemaNotFoundException(schemaName));
+            discover(() -> {
+                localClient.dropLocalNamespace(schemaName, namespace.namespaceId());
+                return null;
+            });
+        }
+
+        @Override
+        public void createTable(ConnectorSession session, ConnectorTableMetadata tableMetadata, SaveMode saveMode)
+        {
+            Reader reader = reader(session, transaction);
+            SchemaTableName tableName = tableMetadata.getTable();
+            scope.requireLocalWrite(reader.context(), tableName.getSchemaName(), false);
+            requireAutocommit();
+            if (saveMode == SaveMode.REPLACE) {
+                throw new TrinoException(NOT_SUPPORTED, "CREATE OR REPLACE TABLE is not supported by Hoglake local writes");
+            }
+            if (!tableMetadata.getProperties().isEmpty()) {
+                throw new TrinoException(NOT_SUPPORTED, "Hoglake local table properties are not supported");
+            }
+            if (tableMetadata.getComment().isPresent()) {
+                throw new TrinoException(NOT_SUPPORTED, "Hoglake local table comments are not supported");
+            }
+            List<HoglakeDtos.ColumnDefinition> columns = toLocalColumnDefinitions(tableMetadata.getColumns());
+            try {
+                discover(() -> reader.clientFor(session, false).createLocalTable(tableName.getSchemaName(), tableName.getTableName(), columns));
+            }
+            catch (TrinoException e) {
+                if (ALREADY_EXISTS.toErrorCode().equals(e.getErrorCode()) || TABLE_ALREADY_EXISTS.toErrorCode().equals(e.getErrorCode())) {
+                    if (saveMode == SaveMode.IGNORE) {
+                        return;
+                    }
+                    throw new TrinoException(TABLE_ALREADY_EXISTS, "Table already exists: " + tableName);
+                }
+                throw e;
+            }
+        }
+
+        @Override
+        public void dropTable(ConnectorSession session, ConnectorTableHandle tableHandle)
+        {
+            Reader reader = reader(session, transaction);
+            HoglakeTableHandle handle = validateLocalTableHandle(tableHandle, reader);
+            if (handle.remote()) {
+                throw new TrinoException(PERMISSION_DENIED, "Hoglake remote table is read-only");
+            }
+            scope.requireLocalWrite(reader.context(), handle.schemaName(), false);
+            requireAutocommit();
+            discover(() -> {
+                reader.clientFor(session, false).dropLocalTable(handle.schemaName(), handle.tableName(), handle.tableUuid());
+                return null;
+            });
+            reader.pinnedTables().remove(handle.schemaTableName());
         }
 
         @Override
         public TableStatisticsMetadata getStatisticsCollectionMetadataForWrite(ConnectorSession session, ConnectorTableMetadata tableMetadata, boolean tableReplace)
         {
-            reader(session, transaction);
-            throw writeDenied();
+            Reader reader = reader(session, transaction);
+            scope.requireLocalWrite(reader.context(), tableMetadata.getTable().getSchemaName(), false);
+            return TableStatisticsMetadata.empty();
         }
 
         @Override
@@ -1363,8 +1792,9 @@ final class HoglakeDedicatedReadPath
         @Override
         public ConnectorOutputTableHandle beginCreateTable(ConnectorSession session, ConnectorTableMetadata tableMetadata, Optional<ConnectorTableLayout> layout, RetryMode retryMode, boolean replace)
         {
-            reader(session, transaction);
-            throw writeDenied();
+            Reader reader = reader(session, transaction);
+            scope.requireLocalWrite(reader.context(), tableMetadata.getTable().getSchemaName(), false);
+            throw new TrinoException(NOT_SUPPORTED, "CREATE TABLE AS SELECT is not supported by Hoglake local writes");
         }
 
         @Override
@@ -1375,14 +1805,46 @@ final class HoglakeDedicatedReadPath
                 Collection<ComputedStatistics> computedStatistics)
         {
             reader(session, transaction);
-            throw writeDenied();
+            throw new TrinoException(NOT_SUPPORTED, "CREATE TABLE AS SELECT is not supported by Hoglake local writes");
         }
 
         @Override
         public ConnectorInsertTableHandle beginInsert(ConnectorSession session, ConnectorTableHandle tableHandle, List<ColumnHandle> columns, RetryMode retryMode)
         {
-            reader(session, transaction);
-            throw writeDenied();
+            Reader reader = reader(session, transaction);
+            HoglakeTableHandle handle = validateLocalTableHandle(tableHandle, reader);
+            if (handle.remote()) {
+                throw new TrinoException(PERMISSION_DENIED, "Hoglake remote table is read-only");
+            }
+            StorageGrant grant = scope.requireLocalWrite(reader.context(), handle.schemaName(), false);
+            requireAutocommit();
+            if (retryMode != RetryMode.NO_RETRIES) {
+                throw new TrinoException(NOT_SUPPORTED, "Task retries are not supported by Hoglake local writes");
+            }
+            requireUnpartitionedLocalTable(reader, session, handle);
+            handle.columns().forEach(column -> HoglakeTypes.toHoglakeType(column.type()));
+            HoglakeVariantShredding.checkWritable(handle.columns());
+            List<HoglakeColumnHandle> inputs = columns.stream().map(HoglakeColumnHandle.class::cast).toList();
+            for (HoglakeColumnHandle column : handle.columns()) {
+                if (!column.nullable() && !inputs.contains(column)) {
+                    throw new TrinoException(CONSTRAINT_VIOLATION, "Missing required column: " + column.name());
+                }
+            }
+            String dataPath = tableWritePath(grant, handle.schemaName(), handle.tableName());
+            reader.context().requirePrimaryWriteLocation(dataPath + "/probe.parquet", reader.context().storage().region());
+            return new HoglakeWriteHandle(
+                    handle.schemaName(),
+                    handle.tableName(),
+                    handle.tableUuid(),
+                    handle.snapshotId(),
+                    dataPath,
+                    handle.columns(),
+                    inputs,
+                    Optional.empty(),
+                    Optional.empty(),
+                    List.of(),
+                    List.of(),
+                    false);
         }
 
         @Override
@@ -1393,8 +1855,11 @@ final class HoglakeDedicatedReadPath
                 Collection<Slice> fragments,
                 Collection<ComputedStatistics> computedStatistics)
         {
-            reader(session, transaction);
-            throw writeDenied();
+            Reader reader = reader(session, transaction);
+            HoglakeWriteHandle handle = (HoglakeWriteHandle) insertHandle;
+            scope.requireLocalWrite(reader.context(), handle.namespace(), false);
+            commitLocalAppend(session, reader, handle, fragments);
+            return Optional.empty();
         }
 
         @Override
@@ -1429,22 +1894,31 @@ final class HoglakeDedicatedReadPath
         @Override
         public RowChangeParadigm getRowChangeParadigm(ConnectorSession session, ConnectorTableHandle tableHandle)
         {
-            reader(session, transaction);
-            throw writeDenied();
+            Reader reader = reader(session, transaction);
+            HoglakeTableHandle handle = validateLocalTableHandle(tableHandle, reader);
+            if (handle.remote()) {
+                throw new TrinoException(PERMISSION_DENIED, "Hoglake remote table is read-only");
+            }
+            scope.requireLocalWrite(reader.context(), handle.schemaName(), false);
+            return RowChangeParadigm.DELETE_ROW_AND_INSERT_ROW;
         }
 
         @Override
         public ColumnHandle getMergeRowIdColumnHandle(ConnectorSession session, ConnectorTableHandle tableHandle)
         {
-            reader(session, transaction);
-            throw writeDenied();
+            Reader reader = reader(session, transaction);
+            HoglakeTableHandle handle = validateLocalTableHandle(tableHandle, reader);
+            if (handle.remote()) {
+                throw new TrinoException(PERMISSION_DENIED, "Hoglake remote table is read-only");
+            }
+            scope.requireLocalWrite(reader.context(), handle.schemaName(), false);
+            return HoglakeColumnHandle.ROW_ID;
         }
 
         @Override
         public Optional<ConnectorPartitioningHandle> getUpdateLayout(ConnectorSession session, ConnectorTableHandle tableHandle)
         {
-            reader(session, transaction);
-            throw writeDenied();
+            return Optional.empty();
         }
 
         @Override
@@ -1454,8 +1928,31 @@ final class HoglakeDedicatedReadPath
                 Map<Integer, Collection<ColumnHandle>> updateCaseColumns,
                 RetryMode retryMode)
         {
-            reader(session, transaction);
-            throw writeDenied();
+            Reader reader = reader(session, transaction);
+            HoglakeTableHandle handle = validateLocalTableHandle(tableHandle, reader);
+            if (handle.remote()) {
+                throw new TrinoException(PERMISSION_DENIED, "Hoglake remote table is read-only");
+            }
+            StorageGrant grant = scope.requireLocalWrite(reader.context(), handle.schemaName(), false);
+            requireAutocommit();
+            if (retryMode != RetryMode.NO_RETRIES) {
+                throw new TrinoException(NOT_SUPPORTED, "Task retries are not supported by Hoglake local writes");
+            }
+            requireUnpartitionedLocalTable(reader, session, handle);
+            if (!updateCaseColumns.isEmpty()) {
+                HoglakeVariantShredding.checkWritable(handle.columns());
+            }
+            handle.columns().forEach(column -> HoglakeTypes.toHoglakeType(column.type()));
+            String dataPath = tableWritePath(grant, handle.schemaName(), handle.tableName());
+            reader.context().requirePrimaryWriteLocation(dataPath + "/probe.parquet", reader.context().storage().region());
+            return new HoglakeDeleteHandle(
+                    handle,
+                    dataPath,
+                    UUID.randomUUID().toString(),
+                    Optional.empty(),
+                    List.of(),
+                    List.of(),
+                    false);
         }
 
         @Override
@@ -1466,8 +1963,7 @@ final class HoglakeDedicatedReadPath
                 Collection<Slice> fragments,
                 Collection<ComputedStatistics> computedStatistics)
         {
-            reader(session, transaction);
-            throw writeDenied();
+            return finishMerge(session, mergeTableHandle, sourceTableHandles, fragments, computedStatistics, MemoryContext.NO_LIMIT);
         }
 
         @Override
@@ -1479,14 +1975,81 @@ final class HoglakeDedicatedReadPath
                 Collection<ComputedStatistics> computedStatistics,
                 MemoryContext memoryContext)
         {
-            reader(session, transaction);
-            throw writeDenied();
+            Reader reader = reader(session, transaction);
+            HoglakeDeleteHandle delete = (HoglakeDeleteHandle) mergeTableHandle;
+            HoglakeTableHandle handle = validateLocalTableHandle(delete.table(), reader);
+            if (handle.remote()) {
+                throw new TrinoException(PERMISSION_DENIED, "Hoglake remote table is read-only");
+            }
+            scope.requireLocalWrite(reader.context(), handle.schemaName(), false);
+            HoglakeClient localClient = reader.clientFor(session, false);
+            HoglakeDeletePublisher publisher = new HoglakeDeletePublisher(
+                    localClient,
+                    sessionFileSystems.create(session),
+                    scanFile -> validateLocalScanFile(reader.context(), scanFile));
+            discover(() -> {
+                publisher.publish(delete, fragments, memoryContext, commit -> {
+                    List<HoglakeDtos.LocalAddFile> addFiles = commit.appends().stream()
+                            .flatMap(append -> append.files().stream())
+                            .map(file -> toLocalAddFile(reader.context(), file))
+                            .toList();
+                    List<HoglakeDtos.LocalAddDv> addDvs = commit.deletes().stream()
+                            .flatMap(deletes -> deletes.files().stream())
+                            .map(dv -> toLocalAddDv(reader.context(), dv))
+                            .toList();
+                    if (!addFiles.isEmpty() || !addDvs.isEmpty()) {
+                        localClient.commitLocalTable(
+                                handle.schemaName(),
+                                handle.tableName(),
+                                new HoglakeDtos.LocalCommitRequest(
+                                        handle.tableUuid(),
+                                        handle.snapshotId(),
+                                        addFiles,
+                                        List.of(),
+                                        addDvs));
+                    }
+                });
+                return null;
+            });
+            reader.pinnedTables().remove(handle.schemaTableName());
+            return Optional.empty();
+        }
+
+        private void commitLocalAppend(ConnectorSession session, Reader reader, HoglakeWriteHandle handle, Collection<Slice> fragments)
+        {
+            List<HoglakeDtos.LocalAddFile> addFiles = decodeFragments(fragments).stream()
+                    .sorted(comparing(HoglakeDtos.FileRegistration::path)
+                            .thenComparingLong(HoglakeDtos.FileRegistration::recordCount)
+                            .thenComparingLong(HoglakeDtos.FileRegistration::fileSizeBytes)
+                            .thenComparingLong(HoglakeDtos.FileRegistration::footerSize))
+                    .map(file -> toLocalAddFile(reader.context(), file))
+                    .toList();
+            if (addFiles.isEmpty()) {
+                return;
+            }
+            discover(() -> {
+                reader.clientFor(session, false).commitLocalTable(
+                        handle.namespace(),
+                        handle.table(),
+                        new HoglakeDtos.LocalCommitRequest(
+                                handle.tableUuid(),
+                                handle.snapshot(),
+                                addFiles,
+                                List.of(),
+                                List.of()));
+                return null;
+            });
+            reader.pinnedTables().remove(new SchemaTableName(handle.namespace(), handle.table()));
         }
 
         @Override
         public Optional<ConnectorTableHandle> applyUpdate(ConnectorSession session, ConnectorTableHandle handle, Map<ColumnHandle, Constant> assignments)
         {
-            reader(session, transaction);
+            Reader reader = reader(session, transaction);
+            HoglakeTableHandle table = validateLocalTableHandle(handle, reader);
+            if (!table.remote() && canWriteLocal(reader.context(), table.schemaName())) {
+                return Optional.empty();
+            }
             throw writeDenied();
         }
 
@@ -1500,7 +2063,11 @@ final class HoglakeDedicatedReadPath
         @Override
         public Optional<ConnectorTableHandle> applyDelete(ConnectorSession session, ConnectorTableHandle handle)
         {
-            reader(session, transaction);
+            Reader reader = reader(session, transaction);
+            HoglakeTableHandle table = validateLocalTableHandle(handle, reader);
+            if (!table.remote() && canWriteLocal(reader.context(), table.schemaName())) {
+                return Optional.empty();
+            }
             throw writeDenied();
         }
 
@@ -1514,8 +2081,11 @@ final class HoglakeDedicatedReadPath
         @Override
         public Optional<ConnectorTableCredentials> getTableCredentials(ConnectorSession session, ConnectorWritableTableHandle tableHandle)
         {
-            reader(session, transaction);
-            throw writeDenied();
+            Reader reader = reader(session, transaction);
+            if (!scope.localWrite() || !reader.context().writable()) {
+                throw writeDenied();
+            }
+            return Optional.empty();
         }
 
         @Override
@@ -1670,14 +2240,178 @@ final class HoglakeDedicatedReadPath
         {
             HoglakeReadSessionContext context = verifier.verify(identity);
             StorageSession storage = context.storage();
+            ImmutableMap.Builder<String, String> credentials = ImmutableMap.<String, String>builder()
+                    .put(EXTRA_CREDENTIALS_ACCESS_KEY_PROPERTY, storage.accessKeyId())
+                    .put(EXTRA_CREDENTIALS_SECRET_KEY_PROPERTY, storage.secretAccessKey())
+                    .put(EXTRA_CREDENTIALS_SESSION_TOKEN_PROPERTY, storage.sessionToken());
+            if (scope.localWrite() && context.writable()) {
+                credentials.put(EXTRA_CREDENTIALS_EXCLUSIVE_CREATE_PROPERTY, "true");
+            }
             TrinoFileSystem fileSystem = delegate.create(ConnectorIdentity.forUser("hoglake-dedicated-read")
-                    .withExtraCredentials(ImmutableMap.of(
-                            EXTRA_CREDENTIALS_ACCESS_KEY_PROPERTY, storage.accessKeyId(),
-                            EXTRA_CREDENTIALS_SECRET_KEY_PROPERTY, storage.secretAccessKey(),
-                            EXTRA_CREDENTIALS_SESSION_TOKEN_PROPERTY, storage.sessionToken()))
+                    .withExtraCredentials(credentials.buildOrThrow())
                     .build());
             return new AuthorizingFileSystem(fileSystem, context, scope);
         }
+    }
+
+    private static final class DedicatedPageSinkProvider
+            implements ConnectorPageSinkProvider
+    {
+        private final HoglakeReadSessionVerifier verifier;
+        private final HoglakePageSinkProvider delegate;
+        private final Scope scope;
+
+        private DedicatedPageSinkProvider(HoglakeReadSessionVerifier verifier, HoglakePageSinkProvider delegate, Scope scope)
+        {
+            this.verifier = requireNonNull(verifier, "verifier is null");
+            this.delegate = requireNonNull(delegate, "delegate is null");
+            this.scope = requireNonNull(scope, "scope is null");
+        }
+
+        private void authorizeWrite(ConnectorSession session, String schemaName, String dataPath)
+        {
+            HoglakeReadSessionContext context = verifier.verify(session.getIdentity());
+            scope.requireLocalWrite(context, schemaName, false);
+            context.requirePrimaryWriteLocation(dataPath + "/probe.parquet", context.storage().region());
+        }
+
+        @Override
+        public ConnectorPageSink createPageSink(
+                ConnectorTransactionHandle transactionHandle,
+                ConnectorSession session,
+                ConnectorOutputTableHandle outputTableHandle,
+                Optional<ConnectorTableCredentials> tableCredentials,
+                ConnectorPageSinkId pageSinkId)
+        {
+            HoglakeWriteHandle handle = (HoglakeWriteHandle) outputTableHandle;
+            authorizeWrite(session, handle.namespace(), handle.dataPath());
+            return delegate.createPageSink(transactionHandle, session, outputTableHandle, tableCredentials, pageSinkId);
+        }
+
+        @Override
+        public ConnectorPageSink createPageSink(
+                ConnectorTransactionHandle transactionHandle,
+                ConnectorSession session,
+                ConnectorInsertTableHandle insertTableHandle,
+                Optional<ConnectorTableCredentials> tableCredentials,
+                ConnectorPageSinkId pageSinkId)
+        {
+            HoglakeWriteHandle handle = (HoglakeWriteHandle) insertTableHandle;
+            authorizeWrite(session, handle.namespace(), handle.dataPath());
+            return delegate.createPageSink(transactionHandle, session, insertTableHandle, tableCredentials, pageSinkId);
+        }
+
+        @Override
+        public ConnectorMergeSink createMergeSink(
+                ConnectorTransactionHandle transactionHandle,
+                ConnectorSession session,
+                ConnectorMergeTableHandle mergeHandle,
+                Optional<ConnectorTableCredentials> tableCredentials,
+                ConnectorPageSinkId pageSinkId,
+                MemoryContext memoryContext)
+        {
+            HoglakeDeleteHandle handle = (HoglakeDeleteHandle) mergeHandle;
+            authorizeWrite(session, handle.table().schemaName(), handle.dataPath());
+            return delegate.createMergeSink(transactionHandle, session, mergeHandle, tableCredentials, pageSinkId, memoryContext);
+        }
+    }
+
+    private static List<HoglakeDtos.ColumnDefinition> toLocalColumnDefinitions(List<ColumnMetadata> columns)
+    {
+        if (columns == null || columns.isEmpty()) {
+            throw new TrinoException(CONSTRAINT_VIOLATION, "Table must define at least one column");
+        }
+        ImmutableList.Builder<HoglakeDtos.ColumnDefinition> result = ImmutableList.builder();
+        for (ColumnMetadata column : columns) {
+            if (column.isHidden()) {
+                continue;
+            }
+            if (column.getComment() != null && !column.getComment().isEmpty()) {
+                throw new TrinoException(NOT_SUPPORTED, "Hoglake local column comments are not supported");
+            }
+            if (!column.getProperties().isEmpty()) {
+                throw new TrinoException(NOT_SUPPORTED, "Hoglake local column properties are not supported");
+            }
+            String name = column.getName();
+            if (name == null || name.isBlank() || name.toLowerCase(ENGLISH).startsWith("_hog")) {
+                throw new TrinoException(INVALID_COLUMN_REFERENCE, "Invalid column name: " + name);
+            }
+            result.add(HoglakeTypes.columnDefinition(name, column.getType(), column.isNullable()));
+        }
+        List<HoglakeDtos.ColumnDefinition> definitions = result.build();
+        if (definitions.isEmpty()) {
+            throw new TrinoException(CONSTRAINT_VIOLATION, "Table must define at least one column");
+        }
+        return definitions;
+    }
+
+    private void requireUnpartitionedLocalTable(Reader reader, ConnectorSession session, HoglakeTableHandle handle)
+    {
+        HoglakeDtos.Table table = discover(() -> reader.clientFor(session, false).getTable(handle.schemaName(), handle.tableName()))
+                .orElseThrow(() -> new TableNotFoundException(new SchemaTableName(handle.schemaName(), handle.tableName())));
+        if (!HoglakePartitioning.read(table.partitionSpec()).isEmpty()) {
+            throw new TrinoException(NOT_SUPPORTED, "Hoglake local writes do not support partitioned tables yet");
+        }
+    }
+
+    private void validateLocalScanFile(HoglakeReadSessionContext context, HoglakeDtos.ScanFile file)
+    {
+        if (file == null || file.dataFile() == null) {
+            throw scope.tableDenied(false);
+        }
+        HoglakeDtos.DataFile dataFile = file.dataFile();
+        scope.requireLocation(context, dataFile.path(), false);
+        if (dataFile.fileSizeBytes() < 0) {
+            throw scope.tableDenied(false);
+        }
+        HoglakeDtos.DeleteFile deleteFile = file.deleteFile();
+        if (deleteFile != null) {
+            scope.requireLocation(context, deleteFile.path(), false);
+            if (deleteFile.dataFileId() != dataFile.dataFileId()) {
+                throw scope.tableDenied(false);
+            }
+        }
+    }
+
+    private static List<HoglakeDtos.FileRegistration> decodeFragments(Collection<Slice> fragments)
+    {
+        ImmutableList.Builder<HoglakeDtos.FileRegistration> files = ImmutableList.builder();
+        for (Slice fragment : fragments) {
+            try {
+                files.add(FRAGMENT_MAPPER.readValue(fragment.getBytes(), HoglakeDtos.FileRegistration.class));
+            }
+            catch (IOException e) {
+                throw new TrinoException(HoglakeErrorCode.HOGLAKE_INVALID_RESPONSE, "Failed to decode Hoglake write fragment", e);
+            }
+        }
+        return files.build();
+    }
+
+    private static String tableWritePath(StorageGrant grant, String schemaName, String tableName)
+    {
+        String prefix = grant.path();
+        String base = "s3://" + grant.bucket() + "/" + (prefix.endsWith("/") ? prefix : prefix + "/");
+        return base + schemaName + "/" + tableName;
+    }
+
+    private static HoglakeDtos.LocalAddFile toLocalAddFile(HoglakeReadSessionContext context, HoglakeDtos.FileRegistration file)
+    {
+        context.requirePrimaryWriteLocation(file.path(), context.storage().region());
+        return new HoglakeDtos.LocalAddFile(
+                file.path(),
+                file.fileSizeBytes(),
+                file.recordCount(),
+                null);
+    }
+
+    private static HoglakeDtos.LocalAddDv toLocalAddDv(HoglakeReadSessionContext context, HoglakeDtos.DeleteRegistration dv)
+    {
+        context.requirePrimaryWriteLocation(dv.path(), context.storage().region());
+        return new HoglakeDtos.LocalAddDv(
+                dv.dataFileId(),
+                dv.path(),
+                dv.fileSizeBytes(),
+                dv.deleteCount());
     }
 
     /**
@@ -1729,7 +2463,11 @@ final class HoglakeDedicatedReadPath
         @Override
         public TrinoOutputFile newOutputFile(Location location)
         {
-            throw targetDenied();
+            if (location == null || !scope.localWrite() || !context.writable()) {
+                throw targetDenied();
+            }
+            context.requirePrimaryWriteLocation(location.toString(), context.storage().region());
+            return delegate.newOutputFile(location);
         }
 
         @Override
