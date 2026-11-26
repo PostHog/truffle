@@ -73,6 +73,12 @@ final class HoglakeReadSessionVerifier
     static final String DEFAULT_PROFILE = "hogtower.aws-session";
     static final String SESSION_TOKEN = HoglakeSharedSessionVerifier.SESSION_TOKEN;
     static final Set<String> AUDIENCES = ImmutableSet.of("trino-session", "hoglake-session", "hoglite-session");
+    static final List<String> READ_ACTIONS = ImmutableList.of("s3:GetObject");
+    static final List<String> WRITE_ACTIONS = ImmutableList.of(
+            "s3:AbortMultipartUpload",
+            "s3:GetObject",
+            "s3:ListMultipartUploadParts",
+            "s3:PutObject");
 
     private static final String EXPERIMENTAL_PROFILE = "storage-session";
     private static final long DEFAULT_CLOCK_SKEW_SECONDS = 60;
@@ -304,9 +310,9 @@ final class HoglakeReadSessionVerifier
 
             String primaryCatalog = text(claims, "primary_catalog");
             require(CATALOG.matcher(primaryCatalog).matches());
-            requireSingleRead(claims.get("cat"), primaryCatalog);
+            boolean writable = parsePrimaryCatalogAccess(claims.get("cat"), primaryCatalog);
             requireSingleRead(claims.get("remote_schemas"), "team");
-            long teamId = teamId(claims.get("prd"));
+            long teamId = teamId(claims.get("prd"), writable);
 
             long issued = positiveSeconds(claims, "iat");
             long notBefore = positiveSeconds(claims, "nbf");
@@ -316,7 +322,7 @@ final class HoglakeReadSessionVerifier
             validateTimes(issued, notBefore, expiry, storage.expiresAt(), sessionDeadline);
 
             Placement placement = placement(claims.get("rtg"));
-            List<StorageGrant> grants = validateGrants(claims.get("grants"), primaryCatalog, placement, storage.region());
+            List<StorageGrant> grants = validateGrants(claims.get("grants"), primaryCatalog, placement, storage.region(), teamId, writable);
             return new HoglakeReadSessionContext(
                     primaryCatalog,
                     token,
@@ -329,7 +335,8 @@ final class HoglakeReadSessionVerifier
                     teamId,
                     placement,
                     storage,
-                    grants);
+                    grants,
+                    writable);
         }
         catch (Exception _) {
             // Refuse without exposing the JWT, claim values, or parser causes.
@@ -428,7 +435,7 @@ final class HoglakeReadSessionVerifier
         require(values.build().equals(AUDIENCES));
     }
 
-    private static long teamId(JsonNode predicates)
+    private static long teamId(JsonNode predicates, boolean writable)
     {
         require(predicates != null && predicates.isObject() && predicates.size() == 1);
         JsonNode teams = predicates.get("team_id");
@@ -439,7 +446,8 @@ final class HoglakeReadSessionVerifier
         long teamId = Long.parseLong(key);
         require(teamId > 0);
         JsonNode permission = entry.getValue();
-        require(permission != null && permission.isTextual() && permission.textValue().equals("read"));
+        String expected = writable ? "write" : "read";
+        require(permission != null && permission.isTextual() && permission.textValue().equals(expected));
         return teamId;
     }
 
@@ -489,7 +497,7 @@ final class HoglakeReadSessionVerifier
         return new Placement(backendId, tenant);
     }
 
-    private List<StorageGrant> validateGrants(JsonNode grantsNode, String catalog, Placement placement, String region)
+    private List<StorageGrant> validateGrants(JsonNode grantsNode, String catalog, Placement placement, String region, long teamId, boolean writable)
     {
         String backend = placement.backendId().toString();
         Set<String> targets = ImmutableSet.<String>builder()
@@ -501,6 +509,7 @@ final class HoglakeReadSessionVerifier
         require(grantsNode != null && grantsNode.isArray() && grantsNode.size() >= targets.size());
 
         String manifestSuffix = "/" + shard(placement.tenant()) + "/t/" + placement.tenant() + "/manifest";
+        String teamDataSuffix = "data/team_" + teamId + "/";
         Set<String> seen = new HashSet<>();
         ImmutableList.Builder<StorageGrant> result = ImmutableList.builder();
         String previousBucket = "";
@@ -523,8 +532,12 @@ final class HoglakeReadSessionVerifier
             require(targets.contains(target));
             require(grantCatalog.equals(catalog));
             require(grantRegion.equals(region));
-            require(actions != null && actions.isArray() && actions.size() == 1 &&
-                    actions.get(0).isTextual() && actions.get(0).textValue().equals("s3:GetObject"));
+            List<String> expectedActions = (writable && target.equals(catalog)) ? WRITE_ACTIONS : READ_ACTIONS;
+            require(matchesActions(actions, expectedActions));
+            if (writable && target.equals(catalog)) {
+                require(prefix && !seen.contains(catalog));
+                require(key.equals(teamDataSuffix) || key.endsWith("/" + teamDataSuffix));
+            }
 
             if (target.equals(backend)) {
                 require(!prefix && key.endsWith(manifestSuffix) && !seen.contains(backend));
@@ -543,6 +556,34 @@ final class HoglakeReadSessionVerifier
         }
         require(seen.equals(targets));
         return result.build();
+    }
+
+    private static boolean parsePrimaryCatalogAccess(JsonNode map, String key)
+    {
+        require(map != null && map.isObject() && map.size() == 1);
+        JsonNode scopes = map.get(key);
+        require(scopes != null && scopes.isArray());
+        if (scopes.size() == 1) {
+            require(scopes.get(0).isTextual() && scopes.get(0).textValue().equals("read"));
+            return false;
+        }
+        require(scopes.size() == 2
+                && scopes.get(0).isTextual() && scopes.get(0).textValue().equals("read")
+                && scopes.get(1).isTextual() && scopes.get(1).textValue().equals("write"));
+        return true;
+    }
+
+    private static boolean matchesActions(JsonNode actions, List<String> expected)
+    {
+        if (actions == null || !actions.isArray() || actions.size() != expected.size()) {
+            return false;
+        }
+        for (int i = 0; i < expected.size(); i++) {
+            if (!actions.get(i).isTextual() || !actions.get(i).textValue().equals(expected.get(i))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static String shard(String tenant)

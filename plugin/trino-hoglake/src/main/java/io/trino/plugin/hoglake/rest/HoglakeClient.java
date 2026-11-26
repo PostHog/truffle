@@ -317,6 +317,117 @@ public class HoglakeClient
                 .orElseThrow(this::catalogNotFound);
     }
 
+    public List<HoglakeDtos.Namespace> listLocalNamespaces()
+    {
+        List<HoglakeDtos.Namespace> all = new ArrayList<>();
+        String after = null;
+        for (int page = 0; page < 1000; page++) {
+            String path = after == null
+                    ? catalogPath("/namespaces")
+                    : catalogPath("/namespaces?after=" + encode(after));
+            HoglakeDtos.LocalNamespaceList response = get(path, new TypeReference<HoglakeDtos.LocalNamespaceList>() {})
+                    .orElseThrow(this::catalogNotFound);
+            if (response.namespaces() != null) {
+                all.addAll(response.namespaces());
+            }
+            String nextAfter = response.nextAfter();
+            if (nextAfter == null || nextAfter.isEmpty()) {
+                return List.copyOf(all);
+            }
+            if (after != null && nextAfter.compareTo(after) <= 0) {
+                throw new TrinoException(HOGLAKE_INVALID_RESPONSE, "Invalid Hoglake pagination cursor");
+            }
+            after = nextAfter;
+        }
+        throw new TrinoException(HOGLAKE_INVALID_RESPONSE, "Hoglake namespace pagination exceeded limit");
+    }
+
+    public List<HoglakeDtos.TableSummary> listLocalTables(String namespace)
+    {
+        List<HoglakeDtos.TableSummary> all = new ArrayList<>();
+        String after = null;
+        for (int page = 0; page < 1000; page++) {
+            String suffix = after == null ? "/tables" : "/tables?after=" + encode(after);
+            Optional<HoglakeDtos.LocalTableList> maybe = get(namespacePath(namespace, suffix), new TypeReference<HoglakeDtos.LocalTableList>() {});
+            if (maybe.isEmpty()) {
+                return List.of();
+            }
+            HoglakeDtos.LocalTableList response = maybe.get();
+            if (response.tables() != null) {
+                all.addAll(response.tables());
+            }
+            String nextAfter = response.nextAfter();
+            if (nextAfter == null || nextAfter.isEmpty()) {
+                return List.copyOf(all);
+            }
+            if (after != null && nextAfter.compareTo(after) <= 0) {
+                throw new TrinoException(HOGLAKE_INVALID_RESPONSE, "Invalid Hoglake pagination cursor");
+            }
+            after = nextAfter;
+        }
+        throw new TrinoException(HOGLAKE_INVALID_RESPONSE, "Hoglake table pagination exceeded limit");
+    }
+
+    public HoglakeDtos.LocalNamespaceMutation createLocalNamespace(String name)
+    {
+        HoglakeDtos.LocalNamespaceMutation result = post(
+                catalogPath("/namespaces"),
+                Map.of("name", name),
+                new TypeReference<HoglakeDtos.LocalNamespaceMutation>() {});
+        if (result == null || !name.equals(result.name()) || result.namespaceId() == null) {
+            throw new TrinoException(HOGLAKE_INVALID_RESPONSE, "Invalid Hoglake namespace response; outcome may be unknown");
+        }
+        return result;
+    }
+
+    public void dropLocalNamespace(String name, long namespaceId)
+    {
+        HoglakeDtos.LocalNamespaceMutation result = write(
+                "DELETE",
+                namespacePath(name, "?namespace_id=" + namespaceId),
+                null,
+                new TypeReference<HoglakeDtos.LocalNamespaceMutation>() {});
+        if (result == null || result.namespaceId() == null || result.namespaceId() != namespaceId) {
+            throw new TrinoException(HOGLAKE_INVALID_RESPONSE, "Invalid Hoglake drop namespace response; outcome may be unknown");
+        }
+    }
+
+    public HoglakeDtos.Table createLocalTable(String namespace, String table, List<HoglakeDtos.ColumnDefinition> columns)
+    {
+        HoglakeDtos.Table result = post(
+                namespacePath(namespace, "/tables"),
+                Map.of("name", table, "columns", columns),
+                new TypeReference<HoglakeDtos.Table>() {});
+        if (result == null || !table.equals(result.name()) || result.tableUuid() == null) {
+            throw new TrinoException(HOGLAKE_INVALID_RESPONSE, "Invalid Hoglake create table response; outcome may be unknown");
+        }
+        return result;
+    }
+
+    public void dropLocalTable(String namespace, String table, String tableUuid)
+    {
+        HoglakeDtos.LocalTableDrop result = write(
+                "DELETE",
+                tablePath(namespace, table, "?table_uuid=" + encode(tableUuid)),
+                null,
+                new TypeReference<HoglakeDtos.LocalTableDrop>() {});
+        if (result == null || !tableUuid.equals(result.tableUuid())) {
+            throw new TrinoException(HOGLAKE_INVALID_RESPONSE, "Invalid Hoglake drop table response; outcome may be unknown");
+        }
+    }
+
+    public HoglakeDtos.LocalCommitResponse commitLocalTable(String namespace, String table, HoglakeDtos.LocalCommitRequest request)
+    {
+        HoglakeDtos.LocalCommitResponse result = post(
+                tablePath(namespace, table, "/commit"),
+                request,
+                new TypeReference<HoglakeDtos.LocalCommitResponse>() {});
+        if (result == null || result.snapshotId() == null || !request.tableUuid().equals(result.tableUuid())) {
+            throw new TrinoException(HOGLAKE_INVALID_RESPONSE, "Invalid Hoglake commit response; outcome may be unknown");
+        }
+        return result;
+    }
+
     public List<HoglakeDtos.Namespace> listNamespaces()
     {
         return get(catalogPath("/namespaces"), new TypeReference<List<HoglakeDtos.Namespace>>() {})
@@ -396,6 +507,11 @@ public class HoglakeClient
     /**
      * Fetch visible data files and deletion vectors for one pinned snapshot and table UUID.
      */
+    public boolean isLocalOnly()
+    {
+        return localOnly;
+    }
+
     public List<HoglakeDtos.ScanFile> scanPinned(String namespace, String table, long snapshot, String tableUuid)
     {
         checkArgument(snapshot >= 0, "snapshot must be non-negative: %s", snapshot);

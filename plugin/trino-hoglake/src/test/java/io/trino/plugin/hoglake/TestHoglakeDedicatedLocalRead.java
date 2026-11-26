@@ -180,7 +180,11 @@ final class TestHoglakeDedicatedLocalRead
     {
         HoglakeClient.RouteGuard guard = HoglakeDedicatedReadPath.createRouteGuard("", "catalog-a");
 
+        guard.check("GET", URI.create("http://metadata.example.test/v1/local-only/catalogs/catalog-a/namespaces"));
+        guard.check("GET", URI.create("http://metadata.example.test/v1/local-only/catalogs/catalog-a/namespaces?after=reports"));
         guard.check("GET", URI.create("http://metadata.example.test/v1/local-only/catalogs/catalog-a/namespaces/reports"));
+        guard.check("GET", URI.create("http://metadata.example.test/v1/local-only/catalogs/catalog-a/namespaces/reports/tables"));
+        guard.check("GET", URI.create("http://metadata.example.test/v1/local-only/catalogs/catalog-a/namespaces/reports/tables?after=metrics"));
         guard.check("GET", URI.create("http://metadata.example.test/v1/local-only/catalogs/catalog-a/namespaces/reports/tables/metrics"));
         guard.check("GET", URI.create("http://metadata.example.test/v1/local-only/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?snapshot=0&table_uuid=" + ALICE_TABLE_UUID));
         guard.check("GET", URI.create("http://metadata.example.test/v1/local-only/catalogs/catalog-a/namespaces/reports/tables/metrics/scan?table_uuid=" + ALICE_TABLE_UUID + "&snapshot=42"));
@@ -194,8 +198,9 @@ final class TestHoglakeDedicatedLocalRead
                 "/v1/local-only/catalogs/catalog-b/namespaces/reports",
                 "/v1/local-only/namespaces/reports",
                 local,
-                local + "/namespaces",
-                local + "/namespaces/reports/tables",
+                local + "/namespaces?x=1",
+                local + "/namespaces?after=",
+                local + "/namespaces/reports/tables?x=1",
                 local + "/namespaces/reports?x=1",
                 local + "/namespaces/reports/tables/metrics?snapshot=5",
                 local + "/namespaces/reports/tables/metrics/scan",
@@ -223,6 +228,36 @@ final class TestHoglakeDedicatedLocalRead
                     REQUEST_DENIED,
                     "catalog-a");
         }
+    }
+
+    @Test
+    void testWritableRouteGuardAllowsOnlyLocalWriteRoutes()
+    {
+        HoglakeClient.RouteGuard guard = HoglakeDedicatedReadPath.createRouteGuard("", "catalog-a", true);
+        String local = "/v1/local-only/catalogs/catalog-a";
+
+        guard.check("POST", URI.create("http://metadata.example.test" + local + "/namespaces"));
+        guard.check("DELETE", URI.create("http://metadata.example.test" + local + "/namespaces/scratch?namespace_id=7"));
+        guard.check("POST", URI.create("http://metadata.example.test" + local + "/namespaces/scratch/tables"));
+        guard.check("DELETE", URI.create("http://metadata.example.test" + local + "/namespaces/scratch/tables/items?table_uuid=" + ALICE_TABLE_UUID));
+        guard.check("POST", URI.create("http://metadata.example.test" + local + "/namespaces/scratch/tables/items/commit"));
+
+        assertRedactedDenial(
+                () -> guard.check("DELETE", URI.create("http://metadata.example.test" + local + "/namespaces/scratch")),
+                REQUEST_DENIED,
+                "scratch");
+        assertRedactedDenial(
+                () -> guard.check("DELETE", URI.create("http://metadata.example.test" + local + "/namespaces/scratch/tables/items")),
+                REQUEST_DENIED,
+                "items");
+        assertRedactedDenial(
+                () -> guard.check("POST", URI.create("http://metadata.example.test/v1/catalogs/catalog-a/namespaces")),
+                REQUEST_DENIED,
+                "catalog-a");
+        assertRedactedDenial(
+                () -> guard.check("PUT", URI.create("http://metadata.example.test" + local + "/namespaces")),
+                REQUEST_DENIED,
+                "catalog-a");
     }
 
     @Test

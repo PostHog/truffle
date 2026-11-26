@@ -776,6 +776,67 @@ final class TestHoglakeReadSessionVerifier
                 SESSION_TOKEN_VALUE);
     }
 
+    @Test
+    void testWritableSessionAcceptedAndStrictlyCoupled()
+    {
+        HoglakeReadSessionContext context = verify(validWritableClaims());
+        assertThat(context.writable()).isTrue();
+        assertThat(context.primaryWritePrefixGrant()).isPresent();
+        context.requirePrimaryWriteLocation("s3://example-customer/data/team_4/scratch/t/part-0.parquet", REGION);
+
+        // cat write with prd read is rejected
+        Map<String, Object> catOnly = validWritableClaims();
+        catOnly.put("prd", Map.of("team_id", Map.of("4", "read")));
+        assertAuthorityDenied(() -> verify(catOnly), ACCESS_KEY, SECRET_KEY, SESSION_TOKEN_VALUE);
+
+        // prd write with cat read is rejected
+        Map<String, Object> prdOnly = validWritableClaims();
+        prdOnly.put("cat", Map.of(CATALOG, List.of("read")));
+        assertAuthorityDenied(() -> verify(prdOnly), ACCESS_KEY, SECRET_KEY, SESSION_TOKEN_VALUE);
+
+        // s3:DeleteObject in primary grant is rejected
+        Map<String, Object> withDelete = validWritableClaims();
+        for (Map<String, Object> grant : grants(withDelete)) {
+            if (CATALOG.equals(grant.get("target"))) {
+                grant.put("actions", List.of("s3:AbortMultipartUpload", "s3:DeleteObject", "s3:GetObject", "s3:ListMultipartUploadParts", "s3:PutObject"));
+            }
+        }
+        assertAuthorityDenied(() -> verify(withDelete), ACCESS_KEY, SECRET_KEY, SESSION_TOKEN_VALUE);
+
+        // Writable manifest grant is rejected
+        Map<String, Object> writableManifest = validWritableClaims();
+        for (Map<String, Object> grant : grants(writableManifest)) {
+            if (BACKEND_UUID.toString().equals(grant.get("target"))) {
+                grant.put("actions", HoglakeReadSessionVerifier.WRITE_ACTIONS);
+            }
+        }
+        assertAuthorityDenied(() -> verify(writableManifest), ACCESS_KEY, SECRET_KEY, SESSION_TOKEN_VALUE);
+
+        // Writable primary prefix outside data/team_<id>/ is rejected
+        Map<String, Object> wrongPrefix = validWritableClaims();
+        for (Map<String, Object> grant : grants(wrongPrefix)) {
+            if (CATALOG.equals(grant.get("target"))) {
+                grant.put("prefix", "data/local_team_4/");
+            }
+        }
+        assertAuthorityDenied(() -> verify(wrongPrefix), ACCESS_KEY, SECRET_KEY, SESSION_TOKEN_VALUE);
+    }
+
+    private static Map<String, Object> validWritableClaims()
+    {
+        Map<String, Object> claims = validClaims();
+        claims.put("cat", Map.of(CATALOG, List.of("read", "write")));
+        claims.put("prd", Map.of("team_id", Map.of("4", "write")));
+        for (Map<String, Object> grant : grants(claims)) {
+            if (CATALOG.equals(grant.get("target"))) {
+                grant.remove("object_key");
+                grant.put("prefix", "data/team_4/");
+                grant.put("actions", new ArrayList<>(HoglakeReadSessionVerifier.WRITE_ACTIONS));
+            }
+        }
+        return claims;
+    }
+
     private static Map<String, Object> validClaims()
     {
         long iat = NOW.getEpochSecond() - 1;

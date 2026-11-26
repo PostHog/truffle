@@ -56,7 +56,7 @@ final class S3OutputFile
                 context,
                 location,
                 key,
-                false,
+                context.exclusiveCreate(),
                 new ByteArrayStreamProvider(data));
     }
 

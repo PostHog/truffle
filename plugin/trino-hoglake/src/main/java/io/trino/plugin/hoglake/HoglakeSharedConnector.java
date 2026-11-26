@@ -31,6 +31,7 @@ import io.trino.spi.connector.ColumnMetadata;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorAccessControl;
 import io.trino.spi.connector.ConnectorAnalyzeMetadata;
+import io.trino.spi.connector.ConnectorCapabilities;
 import io.trino.spi.connector.ConnectorInsertTableHandle;
 import io.trino.spi.connector.ConnectorMergeSink;
 import io.trino.spi.connector.ConnectorMergeTableHandle;
@@ -145,9 +146,21 @@ public final class HoglakeSharedConnector
     }
 
     @Override
+    public Set<ConnectorCapabilities> getCapabilities()
+    {
+        return readSessions.map(HoglakeDedicatedReadPath::localWritesEnabled).orElse(false)
+                ? Set.of(ConnectorCapabilities.NOT_NULL_COLUMN_CONSTRAINT)
+                : Set.of();
+    }
+
+    @Override
     public ConnectorTransactionHandle beginTransaction(IsolationLevel isolationLevel, boolean readOnly, boolean autoCommit)
     {
-        return new HoglakeTransactionHandle(UUID.randomUUID());
+        HoglakeTransactionHandle handle = new HoglakeTransactionHandle(UUID.randomUUID());
+        if (!autoCommit) {
+            readSessions.ifPresent(path -> path.markNonAutoCommit(handle));
+        }
+        return handle;
     }
 
     @Override
@@ -336,6 +349,9 @@ public final class HoglakeSharedConnector
                 Optional<ConnectorTableCredentials> tableCredentials,
                 ConnectorPageSinkId pageSinkId)
         {
+            if (isReadSession(session)) {
+                return readSessions.orElseThrow().pageSinkProvider().createPageSink(transactionHandle, session, outputTableHandle, tableCredentials, pageSinkId);
+            }
             throw denyExecution(session);
         }
 
@@ -347,6 +363,9 @@ public final class HoglakeSharedConnector
                 Optional<ConnectorTableCredentials> tableCredentials,
                 ConnectorPageSinkId pageSinkId)
         {
+            if (isReadSession(session)) {
+                return readSessions.orElseThrow().pageSinkProvider().createPageSink(transactionHandle, session, insertTableHandle, tableCredentials, pageSinkId);
+            }
             throw denyExecution(session);
         }
 
@@ -370,6 +389,9 @@ public final class HoglakeSharedConnector
                 ConnectorPageSinkId pageSinkId,
                 MemoryContext memoryContext)
         {
+            if (isReadSession(session)) {
+                return readSessions.orElseThrow().pageSinkProvider().createMergeSink(transactionHandle, session, mergeHandle, tableCredentials, pageSinkId, memoryContext);
+            }
             throw denyExecution(session);
         }
     }

@@ -49,6 +49,7 @@ public class HoglakeSharedConfig
     private Optional<String> readSessionProfile = Optional.empty();
     private Set<String> readSessionRemoteTargets = ImmutableSet.of();
     private boolean readSessionLocalRead;
+    private boolean writeSessionLocalWrite;
 
     @NotNull
     public URI getUri()
@@ -234,6 +235,19 @@ public class HoglakeSharedConfig
     public HoglakeSharedConfig setReadSessionLocalRead(boolean readSessionLocalRead)
     {
         this.readSessionLocalRead = readSessionLocalRead;
+        return this;
+    }
+
+    public boolean isWriteSessionLocalWrite()
+    {
+        return writeSessionLocalWrite;
+    }
+
+    @Config("hoglake.shared.write-session-local-write")
+    @ConfigDescription("Allow writable dedicated sessions to execute local DDL and DML on non-reserved schemas; requires read-session-local-read")
+    public HoglakeSharedConfig setWriteSessionLocalWrite(boolean writeSessionLocalWrite)
+    {
+        this.writeSessionLocalWrite = writeSessionLocalWrite;
         return this;
     }
 }
