@@ -15,6 +15,7 @@ package io.trino.plugin.hoglake;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import io.airlift.log.Logger;
 import io.airlift.slice.Slice;
 import io.trino.filesystem.FileEntry;
@@ -33,6 +34,7 @@ import io.trino.plugin.hoglake.rest.HoglakeDtos;
 import io.trino.spi.StandardErrorCode;
 import io.trino.spi.TrinoException;
 import io.trino.spi.connector.ConnectorSession;
+import io.trino.spi.connector.SchemaTableName;
 import org.apache.parquet.column.statistics.Statistics;
 import org.apache.parquet.io.MessageColumnIO;
 import org.apache.parquet.schema.GroupType;
@@ -129,6 +131,15 @@ final class HoglakeAddFiles
                 properties.get("replace_range_end") != null;
     }
 
+    /**
+     * Whether the statement deletes refused files on a validation failure.
+     * The caller needs the permission to delete from the table for it.
+     */
+    static boolean deletesOnFailure(Map<String, Object> properties)
+    {
+        return Boolean.TRUE.equals(properties.get("delete_on_failure"));
+    }
+
     static HoglakeAddFilesHandle plan(HoglakeClient client, HoglakeTableHandle table, Map<String, Object> properties)
     {
         Optional<String> location = Optional.ofNullable((String) properties.get("location"));
@@ -188,7 +199,13 @@ final class HoglakeAddFiles
             throw new TrinoException(NOT_SUPPORTED, "Hoglake server does not support " + REPLACEMENT_CAPABILITY + " required to replace data with add_files");
         }
         String dataPath = catalog.dataPath().endsWith("/") ? catalog.dataPath() : catalog.dataPath() + "/";
-        location.ifPresent(value -> checkInsideDataPath(dataPath, value.endsWith("/") ? value : value + "/"));
+        location.ifPresent(value -> {
+            String directory = value.endsWith("/") ? value : value + "/";
+            checkInsideDataPath(dataPath, directory);
+            if (deleteOnFailure) {
+                checkDeleteOnFailureLocation(dataPath, table, directory);
+            }
+        });
         files.forEach(value -> checkInsideDataPath(dataPath, value));
 
         HoglakeDtos.Table definition = client.getTable(table.schemaName(), table.tableName(), table.snapshotId())
@@ -274,17 +291,40 @@ final class HoglakeAddFiles
 
     /**
      * Files may be registered only from the catalog's own storage, which the server enforces as well.
+     * The catalog's data path is omitted from the error message so callers cannot probe it.
      */
     private static void checkInsideDataPath(String dataPath, String location)
     {
         if (!location.startsWith(dataPath) || location.contains("/../") || location.endsWith("/..")) {
-            throw argument("Location is outside the catalog data path %s: %s".formatted(dataPath, location));
+            throw argument("Location is outside the catalog data path: " + location);
+        }
+    }
+
+    /**
+     * {@code delete_on_failure} may target only a subdirectory under the target table's namespace
+     * data path, never the catalog root, the namespace root, or another namespace.
+     */
+    private static void checkDeleteOnFailureLocation(String dataPath, HoglakeTableHandle table, String location)
+    {
+        String namespaceDataPath = HoglakeMetadata.namespaceDataPath(dataPath, table.schemaName());
+        if (!location.startsWith(namespaceDataPath) || location.contains("/./") || location.endsWith("/.")) {
+            throw argument("Location for delete_on_failure must be a subdirectory inside the table's namespace data path: " + location);
+        }
+        String relative = location.substring(namespaceDataPath.length());
+        if (relative.replace("/", "").isEmpty()) {
+            throw argument("Location for delete_on_failure must be a subdirectory inside the table's namespace data path: " + location);
         }
     }
 
     private static String canonical(String location)
     {
         return Location.of(location).toString();
+    }
+
+    private static String canonicalDirectory(String location)
+    {
+        String normalized = canonical(location);
+        return normalized.endsWith("/") ? normalized : normalized + "/";
     }
 
     static Map<String, Long> execute(ConnectorSession session, HoglakeClient client, TrinoFileSystem fileSystem, HoglakeAddFilesHandle handle)
@@ -307,7 +347,7 @@ final class HoglakeAddFiles
         }
         catch (FilesRefused refusal) {
             if (handle.deleteOnFailure()) {
-                deleteQuietly(fileSystem, listed);
+                deleteQuietly(client, fileSystem, handle, listed);
             }
             throw refusal;
         }
@@ -388,14 +428,84 @@ final class HoglakeAddFiles
         return result;
     }
 
-    private static void deleteQuietly(TrinoFileSystem fileSystem, List<ListedFile> listed)
+    private static void deleteQuietly(HoglakeClient client, TrinoFileSystem fileSystem, HoglakeAddFilesHandle handle, List<ListedFile> listed)
     {
+        if (listed.isEmpty()) {
+            return;
+        }
         try {
-            fileSystem.deleteFiles(listed.stream().map(ListedFile::location).toList());
+            ProtectedFiles protectedFiles = protectedFiles(client, handle.table().schemaTableName());
+            List<Location> deletable = listed.stream()
+                    .map(ListedFile::location)
+                    .filter(location -> !protectedFiles.isProtected(location))
+                    .toList();
+            if (deletable.size() < listed.size()) {
+                log.warn(
+                        "Skipping deletion of %s protected file(s) refused by add_files for %s",
+                        listed.size() - deletable.size(),
+                        handle.table().schemaTableName());
+            }
+            if (!deletable.isEmpty()) {
+                fileSystem.deleteFiles(deletable);
+            }
         }
         catch (IOException | RuntimeException e) {
             log.warn(e, "Could not delete files refused by add_files");
         }
+    }
+
+    private record ProtectedFiles(Set<String> registeredPaths, List<String> otherTableWritePaths)
+    {
+        private boolean isProtected(Location location)
+        {
+            String path = canonical(location.toString());
+            if (registeredPaths.contains(path)) {
+                return true;
+            }
+            for (String prefix : otherTableWritePaths) {
+                if (path.startsWith(prefix)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Live files registered across every local table in the catalog, plus the managed write
+     * directories of all local tables other than the target table. Any failure propagates so
+     * {@link #deleteQuietly} fails closed and deletes nothing.
+     */
+    private static ProtectedFiles protectedFiles(HoglakeClient client, SchemaTableName targetTable)
+    {
+        List<SchemaTableName> tables = new ArrayList<>();
+        for (HoglakeDtos.Namespace namespace : client.listNamespaces()) {
+            if (namespace.isRemote()) {
+                continue;
+            }
+            for (HoglakeDtos.TableSummary table : client.listTables(namespace.name())) {
+                tables.add(new SchemaTableName(namespace.name(), table.name()));
+            }
+        }
+        HoglakeDtos.Catalog catalog = client.getCatalog();
+        long snapshot = catalog.headSnapshotId();
+        String dataPath = catalog.dataPath();
+        ImmutableSet.Builder<String> registered = ImmutableSet.builder();
+        ImmutableList.Builder<String> otherTableWritePaths = ImmutableList.builder();
+        for (SchemaTableName table : tables) {
+            if (!table.equals(targetTable)) {
+                otherTableWritePaths.add(canonicalDirectory(HoglakeMetadata.tableWritePath(dataPath, table.getSchemaName(), table.getTableName())));
+            }
+            for (HoglakeDtos.ScanFile file : client.scan(table.getSchemaName(), table.getTableName(), snapshot)) {
+                if (file.dataFile() != null && file.dataFile().path() != null) {
+                    registered.add(canonical(file.dataFile().path()));
+                }
+                if (file.deleteFile() != null && file.deleteFile().path() != null) {
+                    registered.add(canonical(file.deleteFile().path()));
+                }
+            }
+        }
+        return new ProtectedFiles(registered.build(), otherTableWritePaths.build());
     }
 
     /**

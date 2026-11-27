@@ -15,6 +15,7 @@ package io.trino.plugin.hoglake;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.base.Splitter;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.airlift.bootstrap.Bootstrap;
@@ -30,6 +31,7 @@ import io.trino.spi.Plugin;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorContext;
 import io.trino.spi.connector.ConnectorFactory;
+import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.security.ConnectorIdentity;
 import io.trino.testing.MaterializedResult;
 import io.trino.testing.StandaloneQueryRunner;
@@ -90,11 +92,15 @@ final class TestHoglakeAddFiles
     private final ObjectMapper mapper = new ObjectMapper();
     private final MemoryFileSystemFactory storage = new MemoryFileSystemFactory();
     private final Map<String, HoglakeDtos.Table> tables = new ConcurrentHashMap<>();
+    private final Map<String, Map<String, HoglakeDtos.Table>> catalogTables = new ConcurrentHashMap<>();
+    private final Map<SchemaTableName, List<HoglakeDtos.ScanFile>> committedFiles = new ConcurrentHashMap<>();
     private final Map<String, Long> receipts = new ConcurrentHashMap<>();
     private final List<Request> commits = new CopyOnWriteArrayList<>();
     private final List<String> capabilities = new CopyOnWriteArrayList<>();
     private volatile int commitMode;
     private volatile long endedFiles;
+    private volatile boolean scanFailure;
+    private long nextDataFileId = 1;
     private long snapshot = 10;
     private HttpServer server;
     private HoglakeClient client;
@@ -128,6 +134,19 @@ final class TestHoglakeAddFiles
                 0,
                 0,
                 0));
+        catalogTables.put("test", tables);
+        Map<String, HoglakeDtos.Table> otherTables = new ConcurrentHashMap<>();
+        otherTables.put("victim", new HoglakeDtos.Table(
+                "victim",
+                "other",
+                UUID.randomUUID().toString(),
+                List.of(
+                        new HoglakeDtos.Column(1, 0, "id", "long", null, false),
+                        new HoglakeDtos.Column(2, 1, "name", "string", null, true)),
+                0,
+                0,
+                0));
+        catalogTables.put("other", otherTables);
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", this::handle);
         server.start();
@@ -169,9 +188,11 @@ final class TestHoglakeAddFiles
             throws IOException
     {
         commits.clear();
+        committedFiles.clear();
         receipts.clear();
         commitMode = 0;
         endedFiles = 0;
+        scanFailure = false;
         capabilities.clear();
         capabilities.addAll(List.of("idempotent-append-v1", "atomic-partition-replacement-v1"));
         fileSystem.deleteDirectory(Location.of(DATA_PATH));
@@ -191,15 +212,46 @@ final class TestHoglakeAddFiles
     {
         try (exchange) {
             String path = exchange.getRequestURI().getPath();
-            String tables = "/v1/catalogs/lake/namespaces/test/tables";
+            String namespacesPrefix = "/v1/catalogs/lake/namespaces/";
             if (path.equals("/v1/catalogs/lake")) {
                 respond(exchange, 200, new HoglakeDtos.Catalog("lake", DATA_PATH, snapshot, 1, List.copyOf(capabilities)));
             }
             else if (path.equals("/v1/catalogs/lake/namespaces")) {
-                respond(exchange, 200, List.of(new HoglakeDtos.Namespace("test", 1L)));
+                List<HoglakeDtos.Namespace> namespaces = new ArrayList<>();
+                long namespaceId = 1;
+                for (String name : catalogTables.keySet().stream().sorted().toList()) {
+                    namespaces.add(new HoglakeDtos.Namespace(name, namespaceId++));
+                }
+                respond(exchange, 200, namespaces);
             }
-            else if (path.startsWith(tables + "/") && this.tables.containsKey(path.substring(tables.length() + 1))) {
-                respond(exchange, 200, this.tables.get(path.substring(tables.length() + 1)));
+            else if (path.startsWith(namespacesPrefix)) {
+                String rest = path.substring(namespacesPrefix.length());
+                List<String> parts = Splitter.on('/').splitToList(rest);
+                String namespace = parts.get(0);
+                Map<String, HoglakeDtos.Table> nsTables = catalogTables.get(namespace);
+                if (nsTables == null) {
+                    respond(exchange, 404, Map.of());
+                }
+                else if (parts.size() == 2 && parts.get(1).equals("tables")) {
+                    List<HoglakeDtos.TableSummary> summaries = nsTables.values().stream()
+                            .map(table -> new HoglakeDtos.TableSummary(table.name(), table.tableUuid()))
+                            .toList();
+                    respond(exchange, 200, summaries);
+                }
+                else if (parts.size() == 3 && parts.get(1).equals("tables") && nsTables.containsKey(parts.get(2))) {
+                    respond(exchange, 200, nsTables.get(parts.get(2)));
+                }
+                else if (parts.size() == 4 && parts.get(1).equals("tables") && parts.get(3).equals("scan") && nsTables.containsKey(parts.get(2))) {
+                    if (scanFailure) {
+                        respond(exchange, 500, Map.of("error", "scan_failed"));
+                    }
+                    else {
+                        respond(exchange, 200, committedFiles.getOrDefault(new SchemaTableName(namespace, parts.get(2)), List.of()));
+                    }
+                }
+                else {
+                    respond(exchange, 404, Map.of());
+                }
             }
             else if (path.startsWith("/v1/catalogs/lake/commit/receipts/")) {
                 String key = path.substring(path.lastIndexOf('/') + 1);
@@ -214,6 +266,7 @@ final class TestHoglakeAddFiles
                     return;
                 }
                 snapshot++;
+                recordCommittedFiles(body);
                 receipts.put(body.path("idempotency_key").asText(), snapshot);
                 // The commit applied, but the answer is lost. Mode 200 without a count is a replay answered from the receipt.
                 boolean count = path.endsWith("/replacements/prepared") && commitMode != 201;
@@ -221,6 +274,28 @@ final class TestHoglakeAddFiles
             }
             else {
                 respond(exchange, 404, Map.of());
+            }
+        }
+    }
+
+    private void recordCommittedFiles(JsonNode body)
+    {
+        for (JsonNode append : body.path("appends")) {
+            SchemaTableName table = new SchemaTableName(append.path("namespace").asText(), append.path("table").asText());
+            List<HoglakeDtos.ScanFile> tableFiles = committedFiles.computeIfAbsent(table, _ -> new CopyOnWriteArrayList<>());
+            for (JsonNode file : append.path("files")) {
+                tableFiles.add(new HoglakeDtos.ScanFile(
+                        new HoglakeDtos.DataFile(
+                                nextDataFileId++,
+                                file.path("path").asText(),
+                                "parquet",
+                                file.path("record_count").asLong(),
+                                file.path("file_size_bytes").asLong(),
+                                file.path("footer_size").asLong(),
+                                0,
+                                "complete",
+                                snapshot),
+                        null));
             }
         }
     }
@@ -608,9 +683,83 @@ final class TestHoglakeAddFiles
     void testLocationOutsideTheDataPathIsRefused()
     {
         assertThatThrownBy(() -> addFiles("events", "location => 'memory:///elsewhere/events/', import_id => 'outside'"))
-                .hasMessageContaining("outside the catalog data path");
+                .hasMessageContaining("outside the catalog data path")
+                .hasMessageNotContaining(DATA_PATH)
+                .hasMessageNotContaining("warehouse");
+        assertThatThrownBy(() -> addFiles("events", "files => ARRAY['memory:///elsewhere/a.parquet'], import_id => 'outside_files'"))
+                .hasMessageContaining("outside the catalog data path")
+                .hasMessageNotContaining(DATA_PATH)
+                .hasMessageNotContaining("warehouse");
         assertThatThrownBy(() -> addFiles("events", "location => '" + DATA_PATH + "../elsewhere/', import_id => 'dots'"))
                 .hasMessageContaining("outside the catalog data path");
+        assertThat(commits).isEmpty();
+    }
+
+    @Test
+    void testDeleteOnFailurePreservesRegisteredAndOtherTableFiles()
+            throws IOException
+    {
+        // Committed and historical files of a sibling table in the same namespace
+        String plainDir = DATA_PATH + "data/test/plain/";
+        byte[] plainBytes = plainFile(true, true);
+        write(plainDir + "live.parquet", plainBytes);
+        write(plainDir + "historical.parquet", plainBytes);
+        registerCommittedFile("test", "plain", plainDir + "live.parquet", 2, plainBytes);
+
+        // Validation against events fails (schema mismatch), but sibling table files must survive
+        assertThatThrownBy(() -> addFiles("events", "location => '" + plainDir + "', import_id => 'sibling_delete', delete_on_failure => true"))
+                .hasMessageContaining("has no column");
+        assertThat(fileSystem.newInputFile(Location.of(plainDir + "live.parquet")).exists()).isTrue();
+        assertThat(fileSystem.newInputFile(Location.of(plainDir + "historical.parquet")).exists()).isTrue();
+
+        // A file already registered in events shares a staging directory with a newly staged bad file
+        String shared = IN + "shared/";
+        byte[] committedBytes = eventsFile(NOV_9, 2);
+        write(shared + "committed.parquet", committedBytes);
+        registerCommittedFile("test", "events", shared + "committed.parquet", 2, committedBytes);
+        write(shared + "new_bad.parquet", eventsFile(NOV_9, 1));
+
+        assertThatThrownBy(() -> addFiles("events", "location => '" + shared + "', import_id => 'mixed_delete', expected_rows => 999, delete_on_failure => true"))
+                .hasMessageContaining("expected_rows is 999");
+        assertThat(fileSystem.newInputFile(Location.of(shared + "committed.parquet")).exists()).isTrue();
+        assertThat(fileSystem.newInputFile(Location.of(shared + "new_bad.parquet")).exists()).isFalse();
+
+        // Cross-namespace and catalog/namespace-root locations are refused before reading or deleting
+        String otherDir = DATA_PATH + "data/other/victim/";
+        write(otherDir + "live.parquet", plainBytes);
+        registerCommittedFile("other", "victim", otherDir + "live.parquet", 2, plainBytes);
+
+        assertThatThrownBy(() -> addFiles("events", "location => '" + otherDir + "', import_id => 'other_ns', expected_rows => 999, delete_on_failure => true"))
+                .hasMessageContaining("delete_on_failure")
+                .hasMessageNotContaining(DATA_PATH + "data/test/");
+        assertThat(fileSystem.newInputFile(Location.of(otherDir + "live.parquet")).exists()).isTrue();
+
+        assertThatThrownBy(() -> addFiles("events", "location => '" + DATA_PATH + "', import_id => 'catalog_root', expected_rows => 999, delete_on_failure => true"))
+                .hasMessageContaining("delete_on_failure");
+        assertThatThrownBy(() -> addFiles("events", "location => '" + DATA_PATH + "data/test/', import_id => 'ns_root', expected_rows => 999, delete_on_failure => true"))
+                .hasMessageContaining("delete_on_failure");
+        assertThatThrownBy(() -> addFiles("events", "location => '" + DATA_PATH + "data/test//', import_id => 'ns_root_slash', expected_rows => 999, delete_on_failure => true"))
+                .hasMessageContaining("delete_on_failure");
+        assertThatThrownBy(() -> addFiles("events", "location => '" + DATA_PATH + "data/test/./', import_id => 'ns_root_dot', expected_rows => 999, delete_on_failure => true"))
+                .hasMessageContaining("delete_on_failure");
+        assertThatThrownBy(() -> addFiles("events", "location => '" + DATA_PATH + "data/test_other/sub/', import_id => 'ns_prefix', expected_rows => 999, delete_on_failure => true"))
+                .hasMessageContaining("delete_on_failure");
+        assertThat(fileSystem.newInputFile(Location.of(plainDir + "live.parquet")).exists()).isTrue();
+        assertThat(fileSystem.newInputFile(Location.of(otherDir + "live.parquet")).exists()).isTrue();
+        assertThat(commits).isEmpty();
+    }
+
+    @Test
+    void testDeleteOnFailureFailsClosedWhenCatalogScanFails()
+            throws IOException
+    {
+        String dir = IN + "scan_fail/";
+        write(dir + "unverified.parquet", eventsFile(NOV_9, 1));
+        scanFailure = true;
+
+        assertThatThrownBy(() -> addFiles("events", "location => '" + dir + "', import_id => 'scan_fail', expected_rows => 999, delete_on_failure => true"))
+                .hasMessageContaining("expected_rows is 999");
+        assertThat(fileSystem.newInputFile(Location.of(dir + "unverified.parquet")).exists()).isTrue();
         assertThat(commits).isEmpty();
     }
 
@@ -624,15 +773,18 @@ final class TestHoglakeAddFiles
         String append = "location => '" + IN + "', import_id => 'permissions'";
         String replacement = append + ", replace => true";
         String ranged = append + ", " + range(NOV_9, NOV_10);
+        String deleteOnFailure = append + ", expected_rows => 999, delete_on_failure => true";
 
         runner.getAccessControl().deny(privilege("user", "events", INSERT_TABLE));
         assertThatThrownBy(() -> addFiles("events", append)).hasMessageContaining("Cannot insert into table");
         runner.getAccessControl().reset();
 
-        // Replacing data deletes it, so it needs the permission to delete as well
+        // Replacing data or deleting refused files on failure needs the permission to delete as well
         runner.getAccessControl().deny(privilege("user", "events", DELETE_TABLE));
         assertThatThrownBy(() -> addFiles("events", replacement)).hasMessageContaining("Cannot delete from table");
         assertThatThrownBy(() -> addFiles("events", ranged)).hasMessageContaining("Cannot delete from table");
+        assertThatThrownBy(() -> addFiles("events", deleteOnFailure)).hasMessageContaining("Cannot delete from table");
+        assertThat(fileSystem.newInputFile(Location.of(IN + "a.parquet")).exists()).isTrue();
         assertThat(commits).isEmpty();
         // An append deletes nothing
         addFiles("events", append);
@@ -640,6 +792,23 @@ final class TestHoglakeAddFiles
     }
 
     // ---- helpers -----------------------------------------------------------
+
+    private void registerCommittedFile(String namespace, String table, String path, long recordCount, byte[] bytes)
+    {
+        committedFiles.computeIfAbsent(new SchemaTableName(namespace, table), _ -> new CopyOnWriteArrayList<>())
+                .add(new HoglakeDtos.ScanFile(
+                        new HoglakeDtos.DataFile(
+                                nextDataFileId++,
+                                path,
+                                "parquet",
+                                recordCount,
+                                bytes.length,
+                                (long) ConnectorTestFixtures.footerSize(bytes),
+                                0,
+                                "complete",
+                                snapshot),
+                        null));
+    }
 
     private MaterializedResult addFiles(String table, String properties)
     {
