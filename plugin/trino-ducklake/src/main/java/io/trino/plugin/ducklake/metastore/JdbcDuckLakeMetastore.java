@@ -177,17 +177,50 @@ public class JdbcDuckLakeMetastore
     }
 
     /**
-     * Reads, in one transaction, every file the catalog records under the given names and the
-     * identifier the next recorded file gets. The scan is too slow to hold the snapshot claim of a
-     * commit, so it runs before one. The commit then only has to read the files recorded after the
-     * returned identifier, see {@link DuckLakeCommit#recordedFilesSince}.
+     * Reads, in one transaction, every table location, every file the catalog records under the
+     * given names, and the identifier the next recorded file gets. The scan is too slow to hold
+     * the snapshot claim of a commit, so it runs before one and before any Parquet file is opened.
+     * The commit then only has to read the files recorded after the returned identifier, see
+     * {@link DuckLakeCommit#recordedFilesSince}.
      */
     public DuckLakeCommit.FileRegistrationState fileRegistrationState(Set<String> fileNames)
     {
         try {
             return jdbi.inTransaction(TransactionIsolationLevel.REPEATABLE_READ, handle -> {
-                long nextFileId = snapshotState(handle).nextFileId();
-                return new DuckLakeCommit.FileRegistrationState(fileNames, DuckLakeCommit.recordedFiles(handle, metadataSchema, fileNames), nextFileId);
+                DuckLakeCommit.SnapshotState snapshot = snapshotState(handle);
+                return new DuckLakeCommit.FileRegistrationState(
+                        fileNames,
+                        DuckLakeCommit.tableLocations(handle, metadataSchema, snapshot.snapshotId()),
+                        DuckLakeCommit.recordedFiles(handle, metadataSchema, fileNames),
+                        snapshot.nextFileId(),
+                        Optional.empty());
+            });
+        }
+        catch (JdbiException e) {
+            throw metastoreError(e);
+        }
+    }
+
+    /**
+     * Same as {@link #fileRegistrationState(Set)}, also checking in the same transaction whether
+     * an import receipt tag is already visible for the target table so a concurrent retry is
+     * recognized instead of failing on the files the winning attempt just registered.
+     */
+    public DuckLakeCommit.FileRegistrationState fileRegistrationState(Set<String> fileNames, long tableId, String receiptKey)
+    {
+        try {
+            return jdbi.inTransaction(TransactionIsolationLevel.REPEATABLE_READ, handle -> {
+                DuckLakeCommit.SnapshotState snapshot = snapshotState(handle);
+                Optional<String> receipt = DuckLakeCommit.tableTag(handle, metadataSchema, snapshot.snapshotId(), tableId, receiptKey);
+                if (receipt.isPresent()) {
+                    return new DuckLakeCommit.FileRegistrationState(fileNames, ImmutableList.of(), ImmutableList.of(), snapshot.nextFileId(), receipt);
+                }
+                return new DuckLakeCommit.FileRegistrationState(
+                        fileNames,
+                        DuckLakeCommit.tableLocations(handle, metadataSchema, snapshot.snapshotId()),
+                        DuckLakeCommit.recordedFiles(handle, metadataSchema, fileNames),
+                        snapshot.nextFileId(),
+                        Optional.empty());
             });
         }
         catch (JdbiException e) {

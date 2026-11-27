@@ -937,6 +937,21 @@ public class DuckLakeMetadata
             verifyNoInlinedRows(table, "replacing rows");
         }
         handle.replacementRange().ifPresent(range -> verifyNoInlinedRowsInRange(table, range));
+        for (String path : handle.files()) {
+            DuckLakeFileImporter.validateLocation(dataPath, path);
+        }
+        // Check table directory ownership and existing catalog registrations before opening any
+        // Parquet file in storage, so callers cannot probe schemas or existence of files owned by
+        // other tables or already registered in the catalog. The scan of every recorded file is
+        // also too slow to hold the snapshot claim of a commit, so the commit re-checks these files
+        // together with any tables or files recorded while footers were read.
+        Set<String> fileNames = fileNames(handle.files());
+        DuckLakeCommit.FileRegistrationState registration = metastore.fileRegistrationState(fileNames, table.tableId(), receiptKey);
+        if (registration.receipt().isPresent()) {
+            verifyReceipt(registration.receipt().orElseThrow(), fingerprint);
+            return ImmutableMap.of("added_data_files", 0L);
+        }
+        verifyFilesNotRecorded(table, handle.files(), registration.tableLocations(), registration.recordedFiles());
         List<DuckLakeWriteColumn> columns = DuckLakeColumns.fromCatalog(metastore.columns(table.snapshotId(), table.tableId()), typeManager);
         DuckLakeWriteTarget target = new DuckLakeWriteTarget(table.schemaTableName(), table.tableId(), table.tableLocation(), columns, writePartitioningOf(table));
         List<DuckLakeFileImporter.ImportedFile> imported = DuckLakeFileImporter.readFiles(
@@ -945,10 +960,6 @@ public class DuckLakeMetadata
         Optional<DuckLakeRangeReplacement.Plan> rangePlan = handle.replacementRange().map(range -> rangeReplacement.plan(session, table, range));
         List<RewrittenDeletes> rangeDeletes = rangePlan.map(plan -> rewriteDeleteFiles(session, target, plan.positions(), plan.inlinedDeletions())).orElse(ImmutableList.of());
         Map<Long, Long> endedInlinedDeletions = rangePlan.map(plan -> inlinedDeletionsOutsideDeleteFiles(session, target, plan.wholeFiles(), plan.inlinedDeletions())).orElse(ImmutableMap.of());
-        // The scan of every recorded file is too slow to hold the snapshot claim of a commit, so it
-        // reads here, and the commit checks these files together with the ones recorded since.
-        Set<String> fileNames = fileNames(handle.files());
-        DuckLakeCommit.FileRegistrationState registration = metastore.fileRegistrationState(fileNames);
         Optional<Long> added = commit(commit -> {
             DuckLakeCommit.TableIdentity current = commit.findTable(table.schemaName(), table.tableName())
                     .orElseThrow(() -> new TrinoException(StandardErrorCode.TABLE_NOT_FOUND, "Import target no longer exists"));
@@ -1026,24 +1037,40 @@ public class DuckLakeMetadata
     {
         ListMultimap<Long, String> tableLocations = ArrayListMultimap.create();
         Map<String, Long> visibleTableDirectories = new HashMap<>();
+        Map<String, Set<Long>> nonVisibleTableDirectories = new HashMap<>();
         for (DuckLakeCommit.TableLocation location : locations) {
             String schemaLocation = PathResolver.resolve(dataPath, location.schemaPath(), location.schemaPathIsRelative());
             String tableLocation = PathResolver.resolve(schemaLocation, location.path(), location.pathIsRelative());
             tableLocations.put(location.tableId(), tableLocation);
+            String directory = canonicalDirectory(tableLocation);
             if (location.visible()) {
-                visibleTableDirectories.put(canonicalDirectory(tableLocation), location.tableId());
+                visibleTableDirectories.put(directory, location.tableId());
+            }
+            else {
+                nonVisibleTableDirectories.computeIfAbsent(directory, _ -> new HashSet<>()).add(location.tableId());
             }
         }
         Map<String, String> filesByLocation = new HashMap<>();
         for (String file : files) {
             String location = canonicalFileLocation(file);
+            String locationAsDirectory = location.endsWith("/") ? location : location + "/";
             filesByLocation.put(location, file);
-            // the table whose directory holds the file most closely owns it
-            Optional<Long> owner = visibleTableDirectories.entrySet().stream()
-                    .filter(directory -> location.startsWith(directory.getKey()))
-                    .max(Comparator.comparingInt(directory -> directory.getKey().length()))
-                    .map(Map.Entry::getValue);
-            if (owner.isPresent() && owner.get() != table.tableId()) {
+            // The table whose directory holds the file most closely owns it. Visible tables take
+            // precedence over dropped tables at the same directory (such as a dropped and recreated
+            // table), while a directory belonging only to dropped tables still cannot be imported
+            // into another table.
+            Optional<Map.Entry<String, Long>> visibleOwner = visibleTableDirectories.entrySet().stream()
+                    .filter(directory -> locationAsDirectory.startsWith(directory.getKey()))
+                    .max(Comparator.comparingInt(directory -> directory.getKey().length()));
+            Optional<Map.Entry<String, Set<Long>>> nonVisibleOwner = nonVisibleTableDirectories.entrySet().stream()
+                    .filter(directory -> locationAsDirectory.startsWith(directory.getKey()))
+                    .max(Comparator.comparingInt(directory -> directory.getKey().length()));
+            if (visibleOwner.isPresent() && (nonVisibleOwner.isEmpty() || visibleOwner.get().getKey().length() >= nonVisibleOwner.get().getKey().length())) {
+                if (visibleOwner.get().getValue() != table.tableId()) {
+                    throw new TrinoException(StandardErrorCode.INVALID_PROCEDURE_ARGUMENT, "Imported files cannot be in the directory of another table: " + file);
+                }
+            }
+            else if (nonVisibleOwner.isPresent() && !nonVisibleOwner.get().getValue().contains(table.tableId())) {
                 throw new TrinoException(StandardErrorCode.INVALID_PROCEDURE_ARGUMENT, "Imported files cannot be in the directory of another table: " + file);
             }
         }

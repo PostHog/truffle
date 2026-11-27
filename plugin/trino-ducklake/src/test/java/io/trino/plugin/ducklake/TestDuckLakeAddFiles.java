@@ -15,10 +15,23 @@ package io.trino.plugin.ducklake;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.inject.Injector;
+import com.google.inject.Key;
+import com.google.inject.TypeLiteral;
+import io.airlift.json.JsonCodec;
 import io.trino.Session;
+import io.trino.filesystem.FileIterator;
+import io.trino.filesystem.Location;
+import io.trino.filesystem.TrinoFileSystem;
+import io.trino.filesystem.TrinoFileSystemFactory;
+import io.trino.filesystem.TrinoInputFile;
+import io.trino.filesystem.TrinoOutputFile;
 import io.trino.parquet.writer.ParquetWriter;
 import io.trino.parquet.writer.ParquetWriterOptions;
+import io.trino.plugin.base.metrics.FileFormatDataSourceStats;
 import io.trino.plugin.base.security.AllowAllAccessControl;
+import io.trino.plugin.ducklake.metastore.JdbcDuckLakeMetastore;
+import io.trino.plugin.hive.parquet.ParquetReaderConfig;
 import io.trino.spi.Page;
 import io.trino.spi.TrinoException;
 import io.trino.spi.block.Block;
@@ -27,10 +40,13 @@ import io.trino.spi.block.RowBlock;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorTableExecuteHandle;
 import io.trino.spi.connector.ConnectorTableHandle;
+import io.trino.spi.connector.ConnectorViewDefinition;
 import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.security.ConnectorIdentity;
 import io.trino.spi.type.Int128;
 import io.trino.spi.type.LongTimestampWithTimeZone;
 import io.trino.spi.type.Type;
+import io.trino.spi.type.TypeManager;
 import io.trino.spi.type.TypeUtils;
 import io.trino.testing.AbstractTestQueryFramework;
 import io.trino.testing.QueryRunner;
@@ -64,6 +80,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -613,6 +630,91 @@ final class TestDuckLakeAddFiles
         finally {
             assertUpdate("DROP TABLE " + source);
             assertUpdate("DROP TABLE " + target);
+        }
+    }
+
+    @Test
+    void testUnauthorizedAndRecordedFilesAreRejectedBeforeReadingParquetFooters()
+            throws Exception
+    {
+        String target = "target_oracle_" + randomNameSuffix();
+        String other = "other_oracle_" + randomNameSuffix();
+        String dropped = "dropped_oracle_" + randomNameSuffix();
+        String otherUnregistered = catalog.externalParquetFile(other + "/unregistered");
+        String shared = catalog.externalParquetFile("imports_oracle_" + randomNameSuffix());
+        String droppedOrphan = catalog.externalParquetFile(dropped + "/orphan");
+        String validTargetFile = catalog.externalParquetFile(target + "/valid");
+        catalog.executeInDuckDb(
+                "COPY (SELECT 'confidential'::VARCHAR secret_col) TO '%s' (FORMAT PARQUET)".formatted(otherUnregistered),
+                "COPY (SELECT 'shared_secret'::VARCHAR secret_col) TO '%s' (FORMAT PARQUET)".formatted(shared),
+                "COPY (SELECT 'dropped_secret'::VARCHAR dropped_col) TO '%s' (FORMAT PARQUET)".formatted(droppedOrphan),
+                "COPY (SELECT 42::INTEGER id) TO '%s' (FORMAT PARQUET)".formatted(validTargetFile));
+        assertUpdate("CREATE TABLE " + target + " (id INTEGER)");
+        assertUpdate("CREATE TABLE " + other + " (secret_col VARCHAR)");
+        assertUpdate("CREATE TABLE " + dropped + " (dropped_col VARCHAR)");
+        try {
+            assertUpdate("INSERT INTO " + other + " VALUES 'row_in_other'", 1);
+            assertUpdate(addFiles(other, "register_shared", false, location(shared)));
+            assertUpdate("DROP TABLE " + dropped);
+
+            String otherRegistered = "local:///main/%s/%s".formatted(other, catalog.scalar(
+                    "SELECT f.path FROM __ducklake_metadata_lake.ducklake_data_file f JOIN __ducklake_metadata_lake.ducklake_table t USING (table_id) WHERE t.table_name = '%s' AND t.end_snapshot IS NULL AND f.end_snapshot IS NULL AND f.path NOT LIKE '%%imports_oracle_%%'".formatted(other)));
+            String otherNonexistent = "local:///main/%s/does_not_exist.parquet".formatted(other);
+            String otherDirectory = "local:///main/%s".formatted(other);
+            String otherDirectoryWithSlash = "local:///main/%s/".formatted(other);
+
+            // Reject before opening Parquet footers so callers cannot probe schema or existence
+            assertQueryFails(addFiles(target, "other_registered_sql", false, otherRegistered), ".*directory of another table.*");
+            assertQueryFails(addFiles(target, "other_unregistered_sql", false, location(otherUnregistered)), ".*directory of another table.*");
+            assertQueryFails(addFiles(target, "other_nonexistent_sql", false, otherNonexistent), ".*directory of another table.*");
+            assertQueryFails(addFiles(target, "other_dir_sql", false, otherDirectory), ".*directory of another table.*");
+            assertQueryFails(addFiles(target, "other_dir_slash_sql", false, otherDirectoryWithSlash), ".*directory of another table.*");
+            assertQueryFails(addFiles(target, "shared_registered_sql", false, location(shared)), ".*already registered.*");
+            assertQueryFails(addFiles(target, "dropped_orphan_sql", false, location(droppedOrphan)), ".*directory of another table.*");
+
+            // Confirm with an instrumented filesystem that zero files are opened or touched
+            RecordingFileSystemFactory recordingFactory = new RecordingFileSystemFactory(fileSystemFactory());
+            ConnectorSession session = connectorSession();
+            List<Map.Entry<List<String>, String>> rejectedBatches = ImmutableList.of(
+                    Map.entry(ImmutableList.of(otherRegistered), "directory of another table"),
+                    Map.entry(ImmutableList.of(location(otherUnregistered)), "directory of another table"),
+                    Map.entry(ImmutableList.of(otherNonexistent), "directory of another table"),
+                    Map.entry(ImmutableList.of(otherDirectory), "directory of another table"),
+                    Map.entry(ImmutableList.of(otherDirectoryWithSlash), "directory of another table"),
+                    Map.entry(ImmutableList.of(location(shared)), "already registered"),
+                    Map.entry(ImmutableList.of(location(droppedOrphan)), "directory of another table"),
+                    Map.entry(ImmutableList.of(location(validTargetFile), otherRegistered), "directory of another table"),
+                    Map.entry(ImmutableList.of(location(validTargetFile), location(shared)), "already registered"));
+
+            int attempt = 0;
+            for (boolean allowMissing : ImmutableList.of(false, true)) {
+                for (Map.Entry<List<String>, String> rejected : rejectedBatches) {
+                    recordingFactory.reset();
+                    DuckLakeMetadata metadata = newMetadata(recordingFactory);
+                    ConnectorTableExecuteHandle handle = planAddFiles(session, metadata, target, "probe_" + attempt++, allowMissing, rejected.getKey());
+                    assertThatThrownBy(() -> metadata.executeTableExecute(session, handle))
+                            .isInstanceOf(TrinoException.class)
+                            .hasMessageContaining(rejected.getValue())
+                            .hasMessageNotContaining("secret_col")
+                            .hasMessageNotContaining("dropped_col")
+                            .hasMessageNotContaining("Parquet");
+                    assertThat(recordingFactory.touchedLocations()).isEmpty();
+                    assertThat(recordingFactory.fileSystemCreations()).isZero();
+                }
+            }
+
+            // Valid import still opens the Parquet file and registers it cleanly
+            recordingFactory.reset();
+            DuckLakeMetadata metadata = newMetadata(recordingFactory);
+            ConnectorTableExecuteHandle validHandle = planAddFiles(session, metadata, target, "valid_import", false, ImmutableList.of(location(validTargetFile)));
+            assertThat(metadata.executeTableExecute(session, validHandle)).isEqualTo(ImmutableMap.of("added_data_files", 1L));
+            assertThat(recordingFactory.touchedLocations()).contains(Location.of(location(validTargetFile)));
+            assertQuery("SELECT * FROM " + target, "VALUES 42");
+        }
+        finally {
+            assertUpdate("DROP TABLE " + target);
+            assertUpdate("DROP TABLE " + other);
+            assertUpdate("DROP TABLE IF EXISTS " + dropped);
         }
     }
 
@@ -1167,6 +1269,51 @@ final class TestDuckLakeAddFiles
         return connector.getInjector().getInstance(DuckLakeMetadataFactory.class).create(connectorSession().getIdentity());
     }
 
+    private TrinoFileSystemFactory fileSystemFactory()
+    {
+        DuckLakeConnector connector = (DuckLakeConnector) getQueryRunner().getCoordinator().getConnector("ducklake");
+        return connector.getInjector().getInstance(TrinoFileSystemFactory.class);
+    }
+
+    private DuckLakeMetadata newMetadata(TrinoFileSystemFactory customFileSystemFactory)
+    {
+        DuckLakeConnector connector = (DuckLakeConnector) getQueryRunner().getCoordinator().getConnector("ducklake");
+        Injector injector = connector.getInjector();
+        DuckLakeConfig config = injector.getInstance(DuckLakeConfig.class);
+        return new DuckLakeMetadata(
+                injector.getInstance(JdbcDuckLakeMetastore.class),
+                config.getDataPath(),
+                injector.getInstance(Key.get(new TypeLiteral<JsonCodec<DuckLakeDataFile>>() {})),
+                injector.getInstance(Key.get(new TypeLiteral<JsonCodec<DuckLakeMergeFragment>>() {})),
+                injector.getInstance(Key.get(new TypeLiteral<JsonCodec<ConnectorViewDefinition>>() {})),
+                customFileSystemFactory,
+                injector.getInstance(DuckLakeWriterFactory.class),
+                injector.getInstance(FileFormatDataSourceStats.class),
+                injector.getInstance(ParquetReaderConfig.class).toParquetReaderOptions(),
+                config.isAddFilesProcedureEnabled(),
+                config.getAddFilesProcedureMaxConcurrentFileReads(),
+                injector.getInstance(DuckLakeRangeReplacement.class),
+                injector.getInstance(TypeManager.class));
+    }
+
+    private ConnectorTableExecuteHandle planAddFiles(ConnectorSession session, DuckLakeMetadata metadata, String table, String importId, boolean allowMissing, List<String> files)
+    {
+        ConnectorTableHandle tableHandle = metadata.getTableHandle(session, new SchemaTableName("main", table), Optional.empty(), Optional.empty());
+        assertThat(tableHandle).isNotNull();
+        return metadata.getTableHandleForExecute(
+                        session,
+                        new AllowAllAccessControl(),
+                        tableHandle,
+                        DuckLakeAddFilesProcedure.NAME,
+                        ImmutableMap.of(
+                                "files", files,
+                                "import_id", importId,
+                                "allow_missing", allowMissing,
+                                "replace", false),
+                        NO_RETRIES)
+                .orElseThrow();
+    }
+
     private ConnectorSession connectorSession()
     {
         return connectorSession(ImmutableMap.of());
@@ -1317,5 +1464,156 @@ final class TestDuckLakeAddFiles
     {
         String paths = String.join(", ", Arrays.stream(files).map(path -> "'" + path.replace("'", "''") + "'").toList());
         return "ALTER TABLE %s EXECUTE add_files(files => ARRAY[%s], import_id => '%s', replace => %s)".formatted(table, paths, importId, replace);
+    }
+
+    private static final class RecordingFileSystemFactory
+            implements TrinoFileSystemFactory
+    {
+        private final TrinoFileSystemFactory delegate;
+        private final List<Location> touchedLocations = new CopyOnWriteArrayList<>();
+        private int fileSystemCreations;
+
+        private RecordingFileSystemFactory(TrinoFileSystemFactory delegate)
+        {
+            this.delegate = delegate;
+        }
+
+        public void reset()
+        {
+            touchedLocations.clear();
+            fileSystemCreations = 0;
+        }
+
+        public List<Location> touchedLocations()
+        {
+            return ImmutableList.copyOf(touchedLocations);
+        }
+
+        public int fileSystemCreations()
+        {
+            return fileSystemCreations;
+        }
+
+        @Override
+        public TrinoFileSystem create(ConnectorIdentity identity)
+        {
+            fileSystemCreations++;
+            return new RecordingFileSystem(delegate.create(identity), touchedLocations);
+        }
+    }
+
+    private static final class RecordingFileSystem
+            implements TrinoFileSystem
+    {
+        private final TrinoFileSystem delegate;
+        private final List<Location> touchedLocations;
+
+        private RecordingFileSystem(TrinoFileSystem delegate, List<Location> touchedLocations)
+        {
+            this.delegate = delegate;
+            this.touchedLocations = touchedLocations;
+        }
+
+        @Override
+        public TrinoInputFile newInputFile(Location location)
+        {
+            touchedLocations.add(location);
+            return delegate.newInputFile(location);
+        }
+
+        @Override
+        public TrinoInputFile newInputFile(Location location, long length)
+        {
+            touchedLocations.add(location);
+            return delegate.newInputFile(location, length);
+        }
+
+        @Override
+        public TrinoInputFile newInputFile(Location location, long length, Instant lastModified)
+        {
+            touchedLocations.add(location);
+            return delegate.newInputFile(location, length, lastModified);
+        }
+
+        @Override
+        public TrinoOutputFile newOutputFile(Location location)
+        {
+            touchedLocations.add(location);
+            return delegate.newOutputFile(location);
+        }
+
+        @Override
+        public void deleteFile(Location location)
+                throws IOException
+        {
+            touchedLocations.add(location);
+            delegate.deleteFile(location);
+        }
+
+        @Override
+        public void deleteDirectory(Location location)
+                throws IOException
+        {
+            touchedLocations.add(location);
+            delegate.deleteDirectory(location);
+        }
+
+        @Override
+        public void renameFile(Location source, Location target)
+                throws IOException
+        {
+            touchedLocations.add(source);
+            touchedLocations.add(target);
+            delegate.renameFile(source, target);
+        }
+
+        @Override
+        public FileIterator listFiles(Location location)
+                throws IOException
+        {
+            touchedLocations.add(location);
+            return delegate.listFiles(location);
+        }
+
+        @Override
+        public Optional<Boolean> directoryExists(Location location)
+                throws IOException
+        {
+            touchedLocations.add(location);
+            return delegate.directoryExists(location);
+        }
+
+        @Override
+        public void createDirectory(Location location)
+                throws IOException
+        {
+            touchedLocations.add(location);
+            delegate.createDirectory(location);
+        }
+
+        @Override
+        public void renameDirectory(Location source, Location target)
+                throws IOException
+        {
+            touchedLocations.add(source);
+            touchedLocations.add(target);
+            delegate.renameDirectory(source, target);
+        }
+
+        @Override
+        public Set<Location> listDirectories(Location location)
+                throws IOException
+        {
+            touchedLocations.add(location);
+            return delegate.listDirectories(location);
+        }
+
+        @Override
+        public Optional<Location> createTemporaryDirectory(Location targetPath, String temporaryPrefix, String relativePrefix)
+                throws IOException
+        {
+            touchedLocations.add(targetPath);
+            return delegate.createTemporaryDirectory(targetPath, temporaryPrefix, relativePrefix);
+        }
     }
 }
