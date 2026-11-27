@@ -147,6 +147,7 @@ import static io.trino.spi.StandardErrorCode.INVALID_COLUMN_REFERENCE;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.trino.spi.StandardErrorCode.PERMISSION_DENIED;
 import static io.trino.spi.StandardErrorCode.TABLE_ALREADY_EXISTS;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Comparator.comparing;
 import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
@@ -428,7 +429,7 @@ final class HoglakeDedicatedReadPath
                 requestTimeout,
                 new HoglakeTokenSource.Fixed(context.token()),
                 httpClient,
-                createRouteGuard(basePath, context.catalog(), allowWrites),
+                createRouteGuard(basePath, context.catalog(), allowWrites, Optional.of(scope.localTeamSchema(context))),
                 true))
                 : Optional.empty();
         return new Reader(context.token(), context, remoteClient, localClient, new ConcurrentHashMap<>(), scope);
@@ -484,13 +485,23 @@ final class HoglakeDedicatedReadPath
 
     static HoglakeClient.RouteGuard createRouteGuard(String basePath, String verifiedCatalog)
     {
-        return createRouteGuard(basePath, verifiedCatalog, false);
+        return createRouteGuard(basePath, verifiedCatalog, false, Optional.empty());
     }
 
     static HoglakeClient.RouteGuard createRouteGuard(String basePath, String verifiedCatalog, boolean allowWrites)
     {
+        return createRouteGuard(basePath, verifiedCatalog, allowWrites, Optional.empty());
+    }
+
+    static HoglakeClient.RouteGuard createRouteGuard(
+            String basePath,
+            String verifiedCatalog,
+            boolean allowWrites,
+            Optional<String> allowedLocalTeamSchema)
+    {
         requireNonNull(basePath, "basePath is null");
         requireNonNull(verifiedCatalog, "verifiedCatalog is null");
+        requireNonNull(allowedLocalTeamSchema, "allowedLocalTeamSchema is null");
         // Only the local-only routes. An ordinary route, which a remote schema can relay, is denied.
         String catalogPath = basePath + HoglakeClient.LOCAL_ONLY_PREFIX + "/catalogs/" + verifiedCatalog;
         return (method, uri) -> {
@@ -514,7 +525,7 @@ final class HoglakeDedicatedReadPath
 
                 Matcher namespaceMatch = NAMESPACE_ROUTE.matcher(suffix);
                 if (namespaceMatch.matches()) {
-                    if (!isValidSegment(namespaceMatch.group(1)) || rawQuery != null) {
+                    if (!isAllowedLocalNamespaceSegment(namespaceMatch.group(1), allowedLocalTeamSchema) || rawQuery != null) {
                         throw requestDenied();
                     }
                     return;
@@ -522,7 +533,7 @@ final class HoglakeDedicatedReadPath
 
                 Matcher tablesMatch = TABLES_ROUTE.matcher(suffix);
                 if (tablesMatch.matches()) {
-                    if (!isValidSegment(tablesMatch.group(1)) || !isValidOptionalAfterQuery(rawQuery)) {
+                    if (!isAllowedLocalNamespaceSegment(tablesMatch.group(1), allowedLocalTeamSchema) || !isValidOptionalAfterQuery(rawQuery)) {
                         throw requestDenied();
                     }
                     return;
@@ -530,7 +541,7 @@ final class HoglakeDedicatedReadPath
 
                 Matcher tableMatch = TABLE_ROUTE.matcher(suffix);
                 if (tableMatch.matches()) {
-                    if (!isValidSegment(tableMatch.group(1)) || !isValidSegment(tableMatch.group(2)) || rawQuery != null) {
+                    if (!isAllowedLocalNamespaceSegment(tableMatch.group(1), allowedLocalTeamSchema) || !isValidSegment(tableMatch.group(2)) || rawQuery != null) {
                         throw requestDenied();
                     }
                     return;
@@ -538,7 +549,7 @@ final class HoglakeDedicatedReadPath
 
                 Matcher scanMatch = SCAN_ROUTE.matcher(suffix);
                 if (scanMatch.matches()) {
-                    if (!isValidSegment(scanMatch.group(1)) || !isValidSegment(scanMatch.group(2)) || !isValidPinnedScanQuery(rawQuery)) {
+                    if (!isAllowedLocalNamespaceSegment(scanMatch.group(1), allowedLocalTeamSchema) || !isValidSegment(scanMatch.group(2)) || !isValidPinnedScanQuery(rawQuery)) {
                         throw requestDenied();
                     }
                     return;
@@ -560,14 +571,14 @@ final class HoglakeDedicatedReadPath
                 }
                 Matcher tablesMatch = TABLES_ROUTE.matcher(suffix);
                 if (tablesMatch.matches()) {
-                    if (!isValidSegment(tablesMatch.group(1)) || rawQuery != null) {
+                    if (!isAllowedLocalNamespaceSegment(tablesMatch.group(1), allowedLocalTeamSchema) || rawQuery != null) {
                         throw requestDenied();
                     }
                     return;
                 }
                 Matcher commitMatch = COMMIT_ROUTE.matcher(suffix);
                 if (commitMatch.matches()) {
-                    if (!isValidSegment(commitMatch.group(1)) || !isValidSegment(commitMatch.group(2)) || rawQuery != null) {
+                    if (!isAllowedLocalNamespaceSegment(commitMatch.group(1), allowedLocalTeamSchema) || !isValidSegment(commitMatch.group(2)) || rawQuery != null) {
                         throw requestDenied();
                     }
                     return;
@@ -578,14 +589,16 @@ final class HoglakeDedicatedReadPath
             if ("DELETE".equals(method)) {
                 Matcher namespaceMatch = NAMESPACE_ROUTE.matcher(suffix);
                 if (namespaceMatch.matches()) {
-                    if (!isValidSegment(namespaceMatch.group(1)) || !isValidSinglePositiveIntQuery(rawQuery, "namespace_id")) {
+                    if (!isAllowedLocalNamespaceSegment(namespaceMatch.group(1), allowedLocalTeamSchema)
+                            || (allowedLocalTeamSchema.isPresent() && Scope.isProtectedSchema(decodePercentEncoded(namespaceMatch.group(1))))
+                            || !isValidSinglePositiveIntQuery(rawQuery, "namespace_id")) {
                         throw requestDenied();
                     }
                     return;
                 }
                 Matcher tableMatch = TABLE_ROUTE.matcher(suffix);
                 if (tableMatch.matches()) {
-                    if (!isValidSegment(tableMatch.group(1)) || !isValidSegment(tableMatch.group(2)) || !isValidSingleUuidQuery(rawQuery, "table_uuid")) {
+                    if (!isAllowedLocalNamespaceSegment(tableMatch.group(1), allowedLocalTeamSchema) || !isValidSegment(tableMatch.group(2)) || !isValidSingleUuidQuery(rawQuery, "table_uuid")) {
                         throw requestDenied();
                     }
                     return;
@@ -595,6 +608,52 @@ final class HoglakeDedicatedReadPath
 
             throw requestDenied();
         };
+    }
+
+    private static boolean isAllowedLocalNamespaceSegment(String segment, Optional<String> allowedLocalTeamSchema)
+    {
+        if (!isValidSegment(segment)) {
+            return false;
+        }
+        if (allowedLocalTeamSchema.isEmpty()) {
+            return true;
+        }
+        String decoded = decodePercentEncoded(segment);
+        if (decoded == null) {
+            return false;
+        }
+        return !Scope.isProtectedSchema(decoded) || allowedLocalTeamSchema.orElseThrow().equals(segment);
+    }
+
+    private static String decodePercentEncoded(String segment)
+    {
+        if (segment == null || segment.indexOf('%') < 0) {
+            return segment;
+        }
+        byte[] buffer = new byte[segment.length()];
+        int out = 0;
+        for (int i = 0; i < segment.length(); i++) {
+            char ch = segment.charAt(i);
+            if (ch == '%') {
+                if (i + 2 >= segment.length()) {
+                    return null;
+                }
+                int hi = Character.digit(segment.charAt(i + 1), 16);
+                int lo = Character.digit(segment.charAt(i + 2), 16);
+                if (hi < 0 || lo < 0) {
+                    return null;
+                }
+                buffer[out++] = (byte) ((hi << 4) | lo);
+                i += 2;
+            }
+            else {
+                if (ch > 0x7F) {
+                    return null;
+                }
+                buffer[out++] = (byte) ch;
+            }
+        }
+        return new String(buffer, 0, out, UTF_8);
     }
 
     private static boolean isValidOptionalAfterQuery(String rawQuery)
@@ -767,6 +826,11 @@ final class HoglakeDedicatedReadPath
             return "team_" + context.teamId();
         }
 
+        String localTeamSchema(HoglakeReadSessionContext context)
+        {
+            return "local_team_" + context.teamId();
+        }
+
         static boolean isReservedSchema(String schemaName)
         {
             if (schemaName == null) {
@@ -784,6 +848,22 @@ final class HoglakeDedicatedReadPath
             return LOCAL_TEAM_SCHEMA_ANY.matcher(schemaName.toLowerCase(ENGLISH)).matches();
         }
 
+        boolean isForeignLocalTeamSchema(String schemaName, HoglakeReadSessionContext context)
+        {
+            return isProtectedSchema(schemaName) && !localTeamSchema(context).equals(schemaName);
+        }
+
+        boolean isAllowedLocalSchema(String schemaName, HoglakeReadSessionContext context)
+        {
+            if (schemaName == null || schemaName.isBlank() || !schemaName.equals(schemaName.toLowerCase(ENGLISH))) {
+                return false;
+            }
+            if (isForeignLocalTeamSchema(schemaName, context)) {
+                return false;
+            }
+            return mode != Mode.COMBINED || !isReservedSchema(schemaName);
+        }
+
         StorageGrant requireLocalWrite(HoglakeReadSessionContext context, String schemaName, boolean schemaLifecycle)
         {
             if (!localWrite || !context.writable()) {
@@ -798,23 +878,26 @@ final class HoglakeDedicatedReadPath
             if (schemaLifecycle && isProtectedSchema(schemaName)) {
                 throw new TrinoException(PERMISSION_DENIED, "Hoglake default team schema cannot be created or dropped");
             }
+            if (isForeignLocalTeamSchema(schemaName, context)) {
+                throw new TrinoException(PERMISSION_DENIED, "Hoglake local team schema belongs to another team");
+            }
             return context.primaryWritePrefixGrant()
                     .orElseThrow(() -> new TrinoException(PERMISSION_DENIED, "Hoglake session has no writable primary storage prefix"));
         }
 
         Optional<Boolean> resolveRemote(String schemaName, HoglakeReadSessionContext context)
         {
-            if (schemaName == null || !schemaName.equals(schemaName.toLowerCase(ENGLISH))) {
+            if (schemaName == null || schemaName.isBlank() || !schemaName.equals(schemaName.toLowerCase(ENGLISH))) {
                 return Optional.empty();
             }
             return switch (mode) {
-                case LOCAL_ONLY -> Optional.of(false);
+                case LOCAL_ONLY -> isForeignLocalTeamSchema(schemaName, context) ? Optional.empty() : Optional.of(false);
                 case REMOTE_ONLY -> schemaName.equals(teamSchema(context)) ? Optional.of(true) : Optional.empty();
                 case COMBINED -> {
                     if (schemaName.equals(teamSchema(context))) {
                         yield Optional.of(true);
                     }
-                    if (isReservedSchema(schemaName)) {
+                    if (isReservedSchema(schemaName) || isForeignLocalTeamSchema(schemaName, context)) {
                         yield Optional.empty();
                     }
                     yield Optional.of(false);
@@ -878,8 +961,7 @@ final class HoglakeDedicatedReadPath
             }
             boolean validMode = handle.remote()
                     ? supportsRemote() && teamSchema(context).equals(handle.schemaName())
-                    : supportsLocal() && (mode != Mode.COMBINED
-                    || (handle.schemaName().equals(handle.schemaName().toLowerCase(ENGLISH)) && !isReservedSchema(handle.schemaName())));
+                    : supportsLocal() && isAllowedLocalSchema(handle.schemaName(), context);
             if (!validMode
                     || handle.snapshotId() < 0
                     || !isCanonicalUuid(handle.tableUuid())
@@ -1212,10 +1294,7 @@ final class HoglakeDedicatedReadPath
                 for (HoglakeDtos.Namespace namespace : discover(() -> reader.clientFor(session, false).listLocalNamespaces())) {
                     if (namespace != null
                             && !namespace.isRemote()
-                            && namespace.name() != null
-                            && !namespace.name().isBlank()
-                            && namespace.name().equals(namespace.name().toLowerCase(ENGLISH))
-                            && !Scope.isReservedSchema(namespace.name())) {
+                            && scope.isAllowedLocalSchema(namespace.name(), reader.context())) {
                         schemas.add(namespace.name());
                     }
                 }
@@ -1244,8 +1323,7 @@ final class HoglakeDedicatedReadPath
                 }
                 if (!scope.localWrite()
                         || !scope.supportsLocal()
-                        || !requested.equals(requested.toLowerCase(ENGLISH))
-                        || Scope.isReservedSchema(requested)) {
+                        || !scope.isAllowedLocalSchema(requested, reader.context())) {
                     return ImmutableList.of();
                 }
                 return discover(() -> reader.clientFor(session, false).listLocalTables(requested)).stream()
@@ -1264,10 +1342,7 @@ final class HoglakeDedicatedReadPath
                 for (HoglakeDtos.Namespace namespace : discover(() -> reader.clientFor(session, false).listLocalNamespaces())) {
                     if (namespace == null
                             || namespace.isRemote()
-                            || namespace.name() == null
-                            || namespace.name().isBlank()
-                            || !namespace.name().equals(namespace.name().toLowerCase(ENGLISH))
-                            || Scope.isReservedSchema(namespace.name())) {
+                            || !scope.isAllowedLocalSchema(namespace.name(), reader.context())) {
                         continue;
                     }
                     String localSchema = namespace.name();
@@ -1544,8 +1619,7 @@ final class HoglakeDedicatedReadPath
             for (SchemaTableName name : tables) {
                 boolean allowed = name.getSchemaName().equals(scope.teamSchema(reader.context()))
                         || (scope.localWrite() && scope.supportsLocal()
-                        && name.getSchemaName().equals(name.getSchemaName().toLowerCase(ENGLISH))
-                        && !Scope.isReservedSchema(name.getSchemaName()));
+                        && scope.isAllowedLocalSchema(name.getSchemaName(), reader.context()));
                 if (!allowed) {
                     continue;
                 }
@@ -2082,6 +2156,12 @@ final class HoglakeDedicatedReadPath
             Reader reader = reader(session, transaction);
             if (!scope.localWrite() || !reader.context().writable()) {
                 throw writeDenied();
+            }
+            if (tableHandle instanceof HoglakeWriteHandle writeHandle) {
+                scope.requireLocalWrite(reader.context(), writeHandle.namespace(), false);
+            }
+            else {
+                throw scope.tableDenied(false);
             }
             return Optional.empty();
         }
