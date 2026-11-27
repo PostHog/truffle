@@ -554,10 +554,15 @@ public final class DuckLakeCommit
 
     public Optional<String> tableTag(long tableId, String key)
     {
-        return handle.createQuery("SELECT value FROM %s WHERE object_id = :tableId AND key = :key AND %s".formatted(table("ducklake_tag"), visibleUnaliased()))
+        return tableTag(handle, metadataSchema, baseSnapshotId, tableId, key);
+    }
+
+    static Optional<String> tableTag(Handle handle, String metadataSchema, long snapshotId, long tableId, String key)
+    {
+        return handle.createQuery("SELECT value FROM %s WHERE object_id = :tableId AND key = :key AND %s".formatted(qualified(metadataSchema, "ducklake_tag"), visibleUnaliased()))
                 .bind("tableId", tableId)
                 .bind("key", key)
-                .bind("snapshot", baseSnapshotId)
+                .bind("snapshot", snapshotId)
                 .mapTo(String.class)
                 .findOne();
     }
@@ -795,13 +800,18 @@ public final class DuckLakeCommit
      */
     public List<TableLocation> tableLocations()
     {
+        return tableLocations(handle, metadataSchema, baseSnapshotId);
+    }
+
+    static List<TableLocation> tableLocations(Handle handle, String metadataSchema, long snapshotId)
+    {
         return handle.createQuery(
                         """
                         SELECT DISTINCT t.table_id, t.path, t.path_is_relative, s.path AS schema_path, s.path_is_relative AS schema_path_is_relative,
                             %s AS visible
                         FROM %s t
-                        JOIN %s s ON t.schema_id = s.schema_id""".formatted(visible("t"), table("ducklake_table"), table("ducklake_schema")))
-                .bind("snapshot", baseSnapshotId)
+                        JOIN %s s ON t.schema_id = s.schema_id""".formatted(visible("t"), qualified(metadataSchema, "ducklake_table"), qualified(metadataSchema, "ducklake_schema")))
+                .bind("snapshot", snapshotId)
                 .map((rs, _) -> new TableLocation(
                         rs.getLong("table_id"),
                         JdbcDuckLakeMetastore.stringOrEmpty(rs, "path"),
@@ -1308,15 +1318,24 @@ public final class DuckLakeCommit
     public record TableStatsRow(long recordCount, long nextRowId, long fileSizeBytes) {}
 
     /**
-     * What the check of the files to register reads before a commit: the names to register, the
-     * files recorded under them, and the identifier the next recorded file gets.
+     * What the check of the files to register reads before a commit: the names to register, every
+     * table location of the catalog with its visibility at that snapshot, the files recorded under
+     * those names, the identifier the next recorded file gets, and optionally the import receipt
+     * visible at that snapshot.
      */
-    public record FileRegistrationState(Set<String> fileNames, List<RecordedFile> recordedFiles, long nextFileId)
+    public record FileRegistrationState(
+            Set<String> fileNames,
+            List<TableLocation> tableLocations,
+            List<RecordedFile> recordedFiles,
+            long nextFileId,
+            Optional<String> receipt)
     {
         public FileRegistrationState
         {
             fileNames = ImmutableSet.copyOf(fileNames);
+            tableLocations = ImmutableList.copyOf(tableLocations);
             recordedFiles = ImmutableList.copyOf(recordedFiles);
+            requireNonNull(receipt, "receipt is null");
         }
     }
 
