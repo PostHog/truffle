@@ -542,13 +542,17 @@ final class TestHoglakeLocalWrites
                     return;
                 }
                 if ("DELETE".equals(method)) {
+                    if (!body.isEmpty()) {
+                        reply(exchange, 400, true, Map.of("error", "bad_request"));
+                        return;
+                    }
                     if (!tables.get(ns).isEmpty()) {
                         reply(exchange, 409, true, Map.of("error", "conflict"));
                         return;
                     }
                     namespaces.remove(ns);
                     tables.remove(ns);
-                    reply(exchange, 200, true, Map.of("namespace_id", nsId, "snapshot_id", snapshot.incrementAndGet()));
+                    reply(exchange, 200, true, Map.of("dropped_snapshot", snapshot.incrementAndGet()));
                     return;
                 }
             }
@@ -607,12 +611,16 @@ final class TestHoglakeLocalWrites
                     return;
                 }
                 if ("DELETE".equals(method)) {
+                    if (!body.isEmpty()) {
+                        reply(exchange, 400, true, Map.of("error", "bad_request"));
+                        return;
+                    }
                     if (query == null || !query.equals("table_uuid=" + state.uuid)) {
                         reply(exchange, 409, true, Map.of("error", "conflict"));
                         return;
                     }
                     nsTables.remove(tbl);
-                    reply(exchange, 200, true, Map.of("table_uuid", state.uuid, "snapshot_id", snapshot.incrementAndGet()));
+                    reply(exchange, 200, true, Map.of("table_uuid", state.uuid, "dropped_snapshot", snapshot.incrementAndGet()));
                     return;
                 }
             }
@@ -648,13 +656,28 @@ final class TestHoglakeLocalWrites
                 }
                 if ("commit".equals(op) && "POST".equals(method)) {
                     JsonNode req = MAPPER.readTree(body);
+                    // Mirror Hoglake's strict local-only commit key allowlist.
+                    Set<String> allowedTopKeys = Set.of("table_uuid", "base_snapshot_id", "add_files", "add_delete_files");
+                    for (String key : (Iterable<String>) () -> req.fieldNames()) {
+                        if (!allowedTopKeys.contains(key)) {
+                            reply(exchange, 422, true, Map.of("error", "validation"));
+                            return;
+                        }
+                    }
                     if (!state.uuid.equals(req.get("table_uuid").asText())) {
                         reply(exchange, 409, true, Map.of("error", "conflict"));
                         return;
                     }
                     long snap = snapshot.incrementAndGet();
                     state.readSnapshotId = snap;
+                    Set<String> allowedAddKeys = Set.of("path", "record_count", "file_size_bytes", "footer_size");
                     for (JsonNode add : req.path("add_files")) {
+                        for (String key : (Iterable<String>) () -> add.fieldNames()) {
+                            if (!allowedAddKeys.contains(key)) {
+                                reply(exchange, 422, true, Map.of("error", "validation"));
+                                return;
+                            }
+                        }
                         state.files.add(new FileState(
                                 nextId.incrementAndGet(),
                                 add.get("path").asText(),
@@ -662,7 +685,14 @@ final class TestHoglakeLocalWrites
                                 add.get("file_size_bytes").asLong(),
                                 snap));
                     }
-                    for (JsonNode dv : req.path("add_dvs")) {
+                    Set<String> allowedDvKeys = Set.of("data_file_id", "path", "delete_count", "file_size_bytes");
+                    for (JsonNode dv : req.path("add_delete_files")) {
+                        for (String key : (Iterable<String>) () -> dv.fieldNames()) {
+                            if (!allowedDvKeys.contains(key)) {
+                                reply(exchange, 422, true, Map.of("error", "validation"));
+                                return;
+                            }
+                        }
                         long dataFileId = dv.get("data_file_id").asLong();
                         for (FileState file : state.files) {
                             if (file.id == dataFileId) {

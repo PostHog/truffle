@@ -382,12 +382,12 @@ public class HoglakeClient
 
     public void dropLocalNamespace(String name, long namespaceId)
     {
-        HoglakeDtos.LocalNamespaceMutation result = write(
+        HoglakeDtos.LocalNamespaceDrop result = write(
                 "DELETE",
                 namespacePath(name, "?namespace_id=" + namespaceId),
                 null,
-                new TypeReference<HoglakeDtos.LocalNamespaceMutation>() {});
-        if (result == null || result.namespaceId() == null || result.namespaceId() != namespaceId) {
+                new TypeReference<HoglakeDtos.LocalNamespaceDrop>() {});
+        if (result == null || result.droppedSnapshot() == null) {
             throw new TrinoException(HOGLAKE_INVALID_RESPONSE, "Invalid Hoglake drop namespace response; outcome may be unknown");
         }
     }
@@ -411,7 +411,7 @@ public class HoglakeClient
                 tablePath(namespace, table, "?table_uuid=" + encode(tableUuid)),
                 null,
                 new TypeReference<HoglakeDtos.LocalTableDrop>() {});
-        if (result == null || !tableUuid.equals(result.tableUuid())) {
+        if (result == null || result.droppedSnapshot() == null || !tableUuid.equals(result.tableUuid())) {
             throw new TrinoException(HOGLAKE_INVALID_RESPONSE, "Invalid Hoglake drop table response; outcome may be unknown");
         }
     }
@@ -966,13 +966,18 @@ public class HoglakeClient
     {
         URI uri = URI.create(baseUri + path);
         try {
-            HttpRequest request = HttpRequest.newBuilder(uri)
+            HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
                     .timeout(timeout)
-                    .header("Content-Type", "application/json")
                     .header("Accept", "application/json")
-                    .header(REQUEST_ID_HEADER, requestId)
-                    .method(method, HttpRequest.BodyPublishers.ofByteArray(mapper.writeValueAsBytes(body)))
-                    .build();
+                    .header(REQUEST_ID_HEADER, requestId);
+            if (body != null) {
+                builder.header("Content-Type", "application/json")
+                        .method(method, HttpRequest.BodyPublishers.ofByteArray(mapper.writeValueAsBytes(body)));
+            }
+            else {
+                builder.method(method, HttpRequest.BodyPublishers.noBody());
+            }
+            HttpRequest request = builder.build();
             // Send once at the transport layer unless the write is repeatable.
             // Recovery of any other belongs to the caller and requires a durable
             // operation ID.
