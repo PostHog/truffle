@@ -261,6 +261,159 @@ final class TestHoglakeDedicatedLocalRead
     }
 
     @Test
+    void testLocalRouteGuardEnforcesCallerLocalTeamOwnership()
+    {
+        HoglakeClient.RouteGuard guard = HoglakeDedicatedReadPath.createRouteGuard("", "catalog-a", true, Optional.of("local_team_4"));
+        String local = "/v1/local-only/catalogs/catalog-a";
+
+        // Own local_team_4 and non-protected local schemas are allowed for reads and table writes.
+        guard.check("GET", URI.create("http://metadata.example.test" + local + "/namespaces/local_team_4"));
+        guard.check("GET", URI.create("http://metadata.example.test" + local + "/namespaces/local_team_4/tables"));
+        guard.check("GET", URI.create("http://metadata.example.test" + local + "/namespaces/local_team_4/tables/metrics"));
+        guard.check("GET", URI.create("http://metadata.example.test" + local + "/namespaces/local_team_4/tables/metrics/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID));
+        guard.check("POST", URI.create("http://metadata.example.test" + local + "/namespaces/local_team_4/tables"));
+        guard.check("POST", URI.create("http://metadata.example.test" + local + "/namespaces/local_team_4/tables/metrics/commit"));
+        guard.check("DELETE", URI.create("http://metadata.example.test" + local + "/namespaces/local_team_4/tables/metrics?table_uuid=" + ALICE_TABLE_UUID));
+        guard.check("GET", URI.create("http://metadata.example.test" + local + "/namespaces/scratch"));
+        guard.check("DELETE", URI.create("http://metadata.example.test" + local + "/namespaces/scratch?namespace_id=7"));
+
+        // Deleting even own local_team_4 namespace is refused by the route guard.
+        assertRedactedDenial(
+                () -> guard.check("DELETE", URI.create("http://metadata.example.test" + local + "/namespaces/local_team_4?namespace_id=1")),
+                REQUEST_DENIED,
+                "local_team_4");
+
+        // Foreign, non-canonical, uppercase, and percent-encoded local_team_* namespaces are refused on every route.
+        for (String foreign : List.of("local_team_5", "local_team_04", "local_team_0", "LOCAL_TEAM_4", "LOCAL_TEAM_5", "local%5Fteam%5F5", "local%5Fteam%5F4")) {
+            assertRedactedDenial(
+                    () -> guard.check("GET", URI.create("http://metadata.example.test" + local + "/namespaces/" + foreign)),
+                    REQUEST_DENIED,
+                    foreign);
+            assertRedactedDenial(
+                    () -> guard.check("GET", URI.create("http://metadata.example.test" + local + "/namespaces/" + foreign + "/tables")),
+                    REQUEST_DENIED,
+                    foreign);
+            assertRedactedDenial(
+                    () -> guard.check("GET", URI.create("http://metadata.example.test" + local + "/namespaces/" + foreign + "/tables/metrics")),
+                    REQUEST_DENIED,
+                    foreign);
+            assertRedactedDenial(
+                    () -> guard.check("GET", URI.create("http://metadata.example.test" + local + "/namespaces/" + foreign + "/tables/metrics/scan?snapshot=5&table_uuid=" + ALICE_TABLE_UUID)),
+                    REQUEST_DENIED,
+                    foreign);
+            assertRedactedDenial(
+                    () -> guard.check("POST", URI.create("http://metadata.example.test" + local + "/namespaces/" + foreign + "/tables")),
+                    REQUEST_DENIED,
+                    foreign);
+            assertRedactedDenial(
+                    () -> guard.check("POST", URI.create("http://metadata.example.test" + local + "/namespaces/" + foreign + "/tables/metrics/commit")),
+                    REQUEST_DENIED,
+                    foreign);
+            assertRedactedDenial(
+                    () -> guard.check("DELETE", URI.create("http://metadata.example.test" + local + "/namespaces/" + foreign + "?namespace_id=2")),
+                    REQUEST_DENIED,
+                    foreign);
+            assertRedactedDenial(
+                    () -> guard.check("DELETE", URI.create("http://metadata.example.test" + local + "/namespaces/" + foreign + "/tables/metrics?table_uuid=" + ALICE_TABLE_UUID)),
+                    REQUEST_DENIED,
+                    foreign);
+        }
+    }
+
+    @Test
+    void testDedicatedLocalAndCombinedModesRejectForeignLocalTeamSchemas()
+            throws Exception
+    {
+        KeyPair key = keyPair();
+        Path jwksFile = directory.resolve("local-team-isolation-jwks.json");
+        writeJwks(jwksFile, key, KID);
+
+        CallerFixture alice = caller(key, "catalog-a", "tenant_1", "ad", "example.alice", "example.mapped_alice", 4, "ACCESSA", "SECRETA", "TOKENA");
+        byte[] localBytes = writeMetricsParquet(List.of(1L, 2L), List.of("alpha", "beta"));
+        String localPath = alice.tableFile("metrics/part-0.parquet");
+        CredentialCheckingFileSystemFactory fileSystems = new CredentialCheckingFileSystemFactory(
+                Map.of(alice.credentials(), Map.of(localPath, localBytes)));
+
+        List<RecordedRequest> requests = new CopyOnWriteArrayList<>();
+        try (DedicatedTestServer server = DedicatedTestServer.start(requests, request -> {
+            if (!request.isLocalOnly()) {
+                return new Response(404, "{}");
+            }
+            for (String ns : List.of("local_team_4", "local_team_5", "local_team_04")) {
+                Response response = routeLocalTable(request, "catalog-a", ns, "metrics", BOB_TABLE_UUID, 8L, localPath, localBytes.length, 2L, null);
+                if (response.status() != 404) {
+                    return response;
+                }
+            }
+            return new Response(404, "{}");
+        })) {
+            for (boolean combined : List.of(false, true)) {
+                requests.clear();
+                try (HoglakeDedicatedReadPath readPath = combined
+                        ? HoglakeDedicatedReadPath.forSharedReadSession(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), fileSystems, REMOTE_TARGETS)
+                        : new HoglakeDedicatedReadPath(server.baseUri(), Duration.ofSeconds(10), verifier(jwksFile), fileSystems);
+                        StandaloneQueryRunner runner = createRunner(readPath)) {
+                    Session session = querySession(alice.mappedUser(), alice.principal(), alice.jwt(), "local_team_4");
+
+                    // Own local_team_4 is readable.
+                    assertThat(runner.execute(session, "SELECT id, label FROM hoglake.local_team_4.metrics ORDER BY id").getMaterializedRows())
+                            .extracting(row -> List.of(row.getField(0), row.getField(1)))
+                            .containsExactly(List.of(1L, "alpha"), List.of(2L, "beta"));
+
+                    // Foreign and non-canonical local_team_* are absent with zero HTTP requests.
+                    int beforeForeign = requests.size();
+                    for (String foreignSql : List.of(
+                            "SELECT * FROM hoglake.local_team_5.metrics",
+                            "SELECT * FROM hoglake.local_team_04.metrics",
+                            "SELECT * FROM hoglake.local_team_0.metrics")) {
+                        assertThatThrownBy(() -> runner.execute(session, foreignSql))
+                                .as("combined=%s %s", combined, foreignSql)
+                                .isInstanceOf(QueryFailedException.class);
+                    }
+
+                    ConnectorSession connectorSession = session.toConnectorSession(CATALOG_HANDLE);
+                    ConnectorTransactionHandle tx = new HoglakeTransactionHandle(UUID.randomUUID());
+                    try {
+                        ConnectorMetadata metadata = readPath.metadata(connectorSession, tx);
+                        for (String foreignSchema : List.of("local_team_5", "local_team_04", "local_team_0", "LOCAL_TEAM_4", "LOCAL_TEAM_5")) {
+                            assertThat(metadata.schemaExists(connectorSession, foreignSchema)).as("combined=%s %s", combined, foreignSchema).isFalse();
+                            if (!"LOCAL_TEAM_4".equals(foreignSchema)) {
+                                assertThat(metadata.getTableHandle(connectorSession, new SchemaTableName(foreignSchema, "metrics"), Optional.empty(), Optional.empty()))
+                                        .as("combined=%s %s", combined, foreignSchema)
+                                        .isNull();
+                            }
+                            HoglakeTableHandle forgedHandle = localHandle(foreignSchema, "metrics", 8L, BOB_TABLE_UUID);
+                            assertRedactedDenial(
+                                    () -> readPath.splitManager().getSplits(tx, connectorSession, forgedHandle, Set.of(), Constraint.alwaysTrue()),
+                                    LOCAL_TABLE_DENIED,
+                                    foreignSchema);
+                            assertRedactedDenial(
+                                    () -> readPath.pageSourceProvider().createPageSource(
+                                            tx,
+                                            connectorSession,
+                                            localSplit(localPath, Optional.empty()),
+                                            forgedHandle,
+                                            Optional.empty(),
+                                            List.of(),
+                                            DynamicFilter.EMPTY,
+                                            MemoryContext.NO_LIMIT),
+                                    LOCAL_TABLE_DENIED,
+                                    foreignSchema);
+                        }
+                    }
+                    finally {
+                        readPath.end(tx);
+                    }
+
+                    assertThat(requests.subList(beforeForeign, requests.size()))
+                            .as("combined=%s", combined)
+                            .isEmpty();
+                }
+            }
+        }
+    }
+
+    @Test
     void testRemoteRouteGuardAllowsOnlyTheFourRoutesOfTheTeamSchema()
     {
         HoglakeClient.RouteGuard guard = HoglakeDedicatedReadPath.createRemoteRouteGuard("", "catalog-a", "team_4");

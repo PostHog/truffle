@@ -21,6 +21,7 @@ import com.google.common.collect.ImmutableSet;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.trino.Session;
+import io.trino.connector.CatalogHandle;
 import io.trino.filesystem.FileIterator;
 import io.trino.filesystem.Location;
 import io.trino.filesystem.TrinoFileSystem;
@@ -30,16 +31,30 @@ import io.trino.filesystem.TrinoOutputFile;
 import io.trino.filesystem.memory.MemoryFileSystemFactory;
 import io.trino.plugin.hoglake.rest.HoglakeClient;
 import io.trino.spi.Plugin;
+import io.trino.spi.SplitWeight;
+import io.trino.spi.TrinoException;
+import io.trino.spi.catalog.CatalogName;
+import io.trino.spi.connector.CatalogVersion;
+import io.trino.spi.connector.ColumnMetadata;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorCapabilities;
 import io.trino.spi.connector.ConnectorContext;
 import io.trino.spi.connector.ConnectorFactory;
+import io.trino.spi.connector.ConnectorInsertTableHandle;
 import io.trino.spi.connector.ConnectorMetadata;
 import io.trino.spi.connector.ConnectorPageSinkProvider;
 import io.trino.spi.connector.ConnectorPageSourceProvider;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorSplitManager;
+import io.trino.spi.connector.ConnectorTableMetadata;
 import io.trino.spi.connector.ConnectorTransactionHandle;
+import io.trino.spi.connector.Constraint;
+import io.trino.spi.connector.DynamicFilter;
+import io.trino.spi.connector.MemoryContext;
+import io.trino.spi.connector.RetryMode;
+import io.trino.spi.connector.SaveMode;
+import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.security.BasicPrincipal;
 import io.trino.spi.security.Identity;
 import io.trino.spi.session.PropertyMetadata;
@@ -73,14 +88,20 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.UnaryOperator;
 
+import static io.trino.connector.CatalogHandle.createRootCatalogHandle;
 import static io.trino.filesystem.s3.S3FileSystemConstants.EXTRA_CREDENTIALS_EXCLUSIVE_CREATE_PROPERTY;
+import static io.trino.spi.StandardErrorCode.PERMISSION_DENIED;
+import static io.trino.spi.type.BigintType.BIGINT;
+import static io.trino.spi.type.VarcharType.VARCHAR;
 import static io.trino.testing.TestingSession.testSessionBuilder;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -267,6 +288,293 @@ final class TestHoglakeLocalWrites
         }
     }
 
+    @Test
+    void testLocalTeamSchemaOwnershipIsolation(@TempDir Path tempDir)
+            throws Exception
+    {
+        KeyPair keyPair = generateEcKeyPair();
+        Path jwksFile = tempDir.resolve("jwks.json");
+        writeJwks(jwksFile, (ECPublicKey) keyPair.getPublic(), "key-1");
+
+        FakeLocalOnlyServer server = new FakeLocalOnlyServer();
+        String foreignTableUuid = "22222222-bbbb-4222-8222-222222222222";
+        server.seedLocalTable("local_team_5", "secrets", foreignTableUuid);
+        server.seedLocalTable("local_team_04", "padded_secrets", "33333333-cccc-4333-8333-333333333333");
+        server.seedLocalTable("local_team_0", "zero_secrets", "44444444-dddd-4444-8444-444444444444");
+        server.start();
+        try {
+            MemoryFileSystemFactory memoryFs = new MemoryFileSystemFactory();
+            TrinoFileSystemFactory trackingFs = identity -> new S3ToMemoryFileSystem(memoryFs.create(identity));
+
+            HoglakeReadSessionVerifier verifier = new HoglakeReadSessionVerifier(
+                    ISSUER,
+                    jwksFile,
+                    PROFILE,
+                    REMOTE_TARGETS,
+                    ImmutableSet.of(BACKEND_ID),
+                    Optional.of(REGION),
+                    60,
+                    900,
+                    Clock.fixed(NOW, ZoneOffset.UTC),
+                    System::nanoTime);
+
+            HoglakeDedicatedReadPath path = HoglakeDedicatedReadPath.forSharedReadSession(
+                    server.uri(),
+                    Duration.ofSeconds(10),
+                    verifier,
+                    trackingFs,
+                    REMOTE_TARGETS,
+                    true,
+                    "test",
+                    null);
+
+            try (StandaloneQueryRunner runner = createRunner(path)) {
+                String writableJwt = sign(claims("db.alice", true), keyPair.getPrivate(), "key-1");
+                String readOnlyJwt = sign(claims("db.bob", false), keyPair.getPrivate(), "key-1");
+                Session writer = session("db.alice", writableJwt);
+                Session reader = session("db.bob", readOnlyJwt);
+
+                // Caller scoped to team_id = 4 sees own local_team_4 and never other or non-canonical local_team_* schemas
+                for (Session caller : List.of(writer, reader)) {
+                    assertThat(runner.execute(caller, "SHOW SCHEMAS FROM hoglake").getOnlyColumnAsSet())
+                            .contains("team_4", "local_team_4")
+                            .doesNotContain("local_team_5", "local_team_04", "local_team_0");
+                    assertThat(runner.execute(caller, "SELECT table_schema, table_name FROM hoglake.information_schema.tables").getMaterializedRows())
+                            .extracting(row -> row.getField(0) + "." + row.getField(1))
+                            .doesNotContain("local_team_5.secrets", "local_team_04.padded_secrets", "local_team_0.zero_secrets");
+                    assertThat(runner.execute(caller, "SELECT table_schema, table_name FROM hoglake.information_schema.columns").getMaterializedRows())
+                            .extracting(row -> row.getField(0) + "." + row.getField(1))
+                            .doesNotContain("local_team_5.secrets", "local_team_04.padded_secrets", "local_team_0.zero_secrets");
+                }
+
+                // Own local_team_4 supports full table DDL + DML while schema lifecycle remains protected
+                runner.execute(writer, "CREATE TABLE hoglake.local_team_4.own_items (id BIGINT, name VARCHAR)");
+                runner.execute(writer, "INSERT INTO hoglake.local_team_4.own_items VALUES (1, 'mine')");
+                assertThat(runner.execute(writer, "SELECT id, name FROM hoglake.local_team_4.own_items").getMaterializedRows())
+                        .extracting(row -> row.getField(0) + ":" + row.getField(1))
+                        .containsExactly("1:mine");
+                assertThat(runner.execute(writer, "SHOW TABLES FROM hoglake.local_team_4").getOnlyColumnAsSet())
+                        .containsExactly("own_items");
+                runner.execute(writer, "UPDATE hoglake.local_team_4.own_items SET name = 'updated' WHERE id = 1");
+                assertThat(runner.execute(writer, "SELECT name FROM hoglake.local_team_4.own_items").getOnlyValue())
+                        .isEqualTo("updated");
+                runner.execute(writer, "DELETE FROM hoglake.local_team_4.own_items WHERE id = 1");
+                assertThat(runner.execute(writer, "SELECT count(*) FROM hoglake.local_team_4.own_items").getOnlyValue())
+                        .isEqualTo(0L);
+                runner.execute(writer, "DROP TABLE hoglake.local_team_4.own_items");
+
+                // Every SQL read, listing, and write against foreign or non-canonical local_team_* fails with zero upstream requests for those schemas
+                int requestsBefore = server.requestedPaths.size();
+                int writesBefore = server.writeRequests.get();
+                for (String foreignSql : List.of(
+                        "SHOW TABLES FROM hoglake.local_team_5",
+                        "SHOW TABLES FROM hoglake.local_team_04",
+                        "SHOW TABLES FROM hoglake.local_team_0",
+                        "SELECT * FROM hoglake.local_team_5.secrets",
+                        "SELECT * FROM hoglake.local_team_04.padded_secrets",
+                        "SELECT * FROM hoglake.local_team_0.zero_secrets",
+                        "CREATE TABLE hoglake.local_team_5.injected (id BIGINT)",
+                        "CREATE TABLE hoglake.local_team_04.injected (id BIGINT)",
+                        "CREATE TABLE hoglake.local_team_0.injected (id BIGINT)",
+                        "INSERT INTO hoglake.local_team_5.secrets VALUES (99, 'x')",
+                        "UPDATE hoglake.local_team_5.secrets SET name = 'x' WHERE id = 1",
+                        "DELETE FROM hoglake.local_team_5.secrets WHERE id = 1",
+                        "DROP TABLE hoglake.local_team_5.secrets",
+                        "CREATE SCHEMA hoglake.local_team_5",
+                        "DROP SCHEMA hoglake.local_team_5",
+                        "CREATE SCHEMA hoglake.local_team_04",
+                        "DROP SCHEMA hoglake.local_team_04")) {
+                    assertThatThrownBy(() -> runner.execute(writer, foreignSql))
+                            .as(foreignSql)
+                            .isInstanceOf(RuntimeException.class);
+                }
+                assertThat(server.writeRequests.get()).isEqualTo(writesBefore);
+                assertThat(server.requestedPaths.subList(requestsBefore, server.requestedPaths.size()))
+                        .noneMatch(p -> p.contains("local_team_5") || p.contains("local_team_04") || p.contains("local_team_0"));
+
+                // Direct SPI checks: verify metadata, split manager, page source, and page sink reject foreign local_team_* even with forged handles
+                CatalogHandle catalogHandle = createRootCatalogHandle(new CatalogName("hoglake"), new CatalogVersion("test"));
+                ConnectorSession writerSession = writer.toConnectorSession(catalogHandle);
+                ConnectorTransactionHandle tx = new HoglakeTransactionHandle(UUID.randomUUID());
+                try {
+                    ConnectorMetadata metadata = path.metadata(writerSession, tx, true);
+                    int spiRequestsBefore = server.requestedPaths.size();
+                    int spiWritesBefore = server.writeRequests.get();
+
+                    assertThat(metadata.schemaExists(writerSession, "local_team_4")).isTrue();
+                    for (String foreignSchema : List.of("local_team_5", "local_team_04", "local_team_0", "LOCAL_TEAM_4", "LOCAL_TEAM_5")) {
+                        assertThat(metadata.schemaExists(writerSession, foreignSchema)).as(foreignSchema).isFalse();
+                        assertThat(metadata.listTables(writerSession, Optional.of(foreignSchema))).as(foreignSchema).isEmpty();
+
+                        // SchemaTableName normalizes schema names to lowercase, so only test SchemaTableName-based
+                        // SPI calls for schemas that remain foreign after normalization.
+                        if (!"LOCAL_TEAM_4".equals(foreignSchema)) {
+                            assertThat(metadata.getTableHandle(writerSession, new SchemaTableName(foreignSchema, "secrets"), Optional.empty(), Optional.empty()))
+                                    .as(foreignSchema)
+                                    .isNull();
+
+                            ConnectorTableMetadata tableMeta = new ConnectorTableMetadata(
+                                    new SchemaTableName(foreignSchema, "injected"),
+                                    List.of(new ColumnMetadata("id", BIGINT)));
+                            assertThatThrownBy(() -> metadata.createTable(writerSession, tableMeta, SaveMode.FAIL))
+                                    .as("createTable %s", foreignSchema)
+                                    .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                            assertThatThrownBy(() -> metadata.getNewTableLayout(writerSession, tableMeta))
+                                    .as("getNewTableLayout %s", foreignSchema)
+                                    .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                            assertThatThrownBy(() -> metadata.getStatisticsCollectionMetadataForWrite(writerSession, tableMeta, false))
+                                    .as("getStatisticsCollectionMetadataForWrite %s", foreignSchema)
+                                    .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                            assertThatThrownBy(() -> metadata.beginCreateTable(writerSession, tableMeta, Optional.empty(), RetryMode.NO_RETRIES, false))
+                                    .as("beginCreateTable %s", foreignSchema)
+                                    .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        }
+
+                        List<HoglakeColumnHandle> cols = List.of(
+                                new HoglakeColumnHandle("id", 1, BIGINT, true),
+                                new HoglakeColumnHandle("name", 2, VARCHAR, true));
+                        HoglakeTableHandle forgedTable = new HoglakeTableHandle(
+                                foreignSchema,
+                                "secrets",
+                                2L,
+                                foreignTableUuid,
+                                cols,
+                                TupleDomain.all(),
+                                List.of(),
+                                List.of(),
+                                false,
+                                OptionalLong.empty(),
+                                false);
+                        HoglakeSplit forgedSplit = new HoglakeSplit(
+                                1L,
+                                "s3://example-catalog/data/team_4/local_team_5/secrets/part-0.parquet",
+                                64L,
+                                -1L,
+                                Optional.empty(),
+                                0L,
+                                Optional.empty(),
+                                0L,
+                                64L,
+                                SplitWeight.standard(),
+                                OptionalLong.empty(),
+                                Optional.empty());
+                        HoglakeWriteHandle forgedWrite = new HoglakeWriteHandle(
+                                foreignSchema,
+                                "secrets",
+                                foreignTableUuid,
+                                2L,
+                                "s3://example-catalog/data/team_4/" + foreignSchema + "/secrets",
+                                cols,
+                                cols,
+                                Optional.empty(),
+                                Optional.empty(),
+                                List.of(),
+                                List.of(),
+                                false);
+                        HoglakeDeleteHandle forgedDelete = new HoglakeDeleteHandle(
+                                forgedTable,
+                                "s3://example-catalog/data/team_4/" + foreignSchema + "/secrets",
+                                UUID.randomUUID().toString(),
+                                Optional.empty(),
+                                List.of(),
+                                List.of(),
+                                false);
+
+                        assertThatThrownBy(() -> metadata.getTableMetadata(writerSession, forgedTable))
+                                .as("getTableMetadata %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> metadata.getColumnHandles(writerSession, forgedTable))
+                                .as("getColumnHandles %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> metadata.dropTable(writerSession, forgedTable))
+                                .as("dropTable %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> metadata.beginInsert(writerSession, forgedTable, List.copyOf(cols), RetryMode.NO_RETRIES))
+                                .as("beginInsert %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> metadata.finishInsert(writerSession, forgedWrite, List.of(), List.of(), List.of()))
+                                .as("finishInsert %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> metadata.getInsertLayout(writerSession, forgedTable))
+                                .as("getInsertLayout %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> metadata.getRowChangeParadigm(writerSession, forgedTable))
+                                .as("getRowChangeParadigm %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> metadata.getMergeRowIdColumnHandle(writerSession, forgedTable))
+                                .as("getMergeRowIdColumnHandle %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> metadata.beginMerge(writerSession, forgedTable, Map.of(), RetryMode.NO_RETRIES))
+                                .as("beginMerge %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> metadata.finishMerge(writerSession, forgedDelete, List.of(), List.of(), List.of()))
+                                .as("finishMerge %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> metadata.applyUpdate(writerSession, forgedTable, Map.of()))
+                                .as("applyUpdate %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> metadata.applyDelete(writerSession, forgedTable))
+                                .as("applyDelete %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> path.splitManager().getSplits(tx, writerSession, forgedTable, Set.of(), Constraint.alwaysTrue()))
+                                .as("getSplits %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> path.pageSourceProvider().createPageSource(
+                                tx,
+                                writerSession,
+                                forgedSplit,
+                                forgedTable,
+                                Optional.empty(),
+                                List.of(),
+                                DynamicFilter.EMPTY,
+                                MemoryContext.NO_LIMIT))
+                                .as("createPageSource %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> path.pageSinkProvider().createPageSink(
+                                tx,
+                                writerSession,
+                                (ConnectorInsertTableHandle) forgedWrite,
+                                Optional.empty(),
+                                () -> 1L))
+                                .as("createPageSink %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                        assertThatThrownBy(() -> path.pageSinkProvider().createMergeSink(
+                                tx,
+                                writerSession,
+                                forgedDelete,
+                                Optional.empty(),
+                                () -> 1L,
+                                MemoryContext.NO_LIMIT))
+                                .as("createMergeSink %s", foreignSchema)
+                                .isInstanceOfSatisfying(TrinoException.class, e -> assertThat(e.getErrorCode()).isEqualTo(PERMISSION_DENIED.toErrorCode()));
+                    }
+
+                    // Even if relationFilter returns a foreign local_team_* table, streamRelationColumns skips it
+                    assertThat(ImmutableList.copyOf(metadata.streamRelationColumns(
+                            writerSession,
+                            Optional.empty(),
+                            _ -> Set.of(new SchemaTableName("local_team_5", "secrets"), new SchemaTableName("local_team_04", "padded_secrets")))))
+                            .isEmpty();
+                    assertThat(ImmutableList.copyOf(metadata.streamRelationColumns(
+                            writerSession,
+                            Optional.of("local_team_5"),
+                            UnaryOperator.identity())))
+                            .isEmpty();
+
+                    assertThat(server.writeRequests.get()).isEqualTo(spiWritesBefore);
+                    assertThat(server.requestedPaths.subList(spiRequestsBefore, server.requestedPaths.size()))
+                            .noneMatch(p -> p.contains("local_team_5") || p.contains("local_team_04") || p.contains("local_team_0") || p.contains("LOCAL_TEAM_"));
+                }
+                finally {
+                    path.end(tx);
+                }
+            }
+        }
+        finally {
+            server.stop();
+        }
+    }
+
     private static Session session(String principal, String jwt)
     {
         Identity identity = Identity.forUser(principal)
@@ -445,6 +753,7 @@ final class TestHoglakeLocalWrites
     private static final class FakeLocalOnlyServer
     {
         private final AtomicInteger writeRequests = new AtomicInteger();
+        private final List<String> requestedPaths = new CopyOnWriteArrayList<>();
         private final AtomicLong nextId = new AtomicLong(10);
         private final AtomicLong snapshot = new AtomicLong(1);
         private final Map<String, Long> namespaces = new ConcurrentHashMap<>();
@@ -455,6 +764,16 @@ final class TestHoglakeLocalWrites
         {
             namespaces.put("local_team_4", 1L);
             tables.put("local_team_4", new ConcurrentHashMap<>());
+        }
+
+        private void seedLocalTable(String namespace, String tableName, String tableUuid)
+        {
+            namespaces.computeIfAbsent(namespace, _ -> nextId.incrementAndGet());
+            Map<String, TableState> nsTables = tables.computeIfAbsent(namespace, _ -> new ConcurrentHashMap<>());
+            List<Map<String, Object>> cols = List.of(
+                    Map.of("field_id", 1, "name", "id", "type", "int64", "nullable", true),
+                    Map.of("field_id", 2, "name", "name", "type", "varchar", "nullable", true));
+            nsTables.put(tableName, new TableState(namespace, tableName, tableUuid, snapshot.incrementAndGet(), cols));
         }
 
         private void start()
@@ -485,6 +804,7 @@ final class TestHoglakeLocalWrites
             String query = exchange.getRequestURI().getRawQuery();
             String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
 
+            requestedPaths.add(method + " " + path + (query == null ? "" : "?" + query));
             if (!"GET".equals(method)) {
                 writeRequests.incrementAndGet();
             }
