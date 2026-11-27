@@ -1100,8 +1100,8 @@ ALTER TABLE example.team_2.events EXECUTE add_files(
 The procedure returns the metrics `added_data_files` and `ended_data_files`.
 It runs on the coordinator, and uses the filesystem and the catalog's
 credentials. It needs the permission to insert into the table, and to delete
-from it when it replaces data. The name and properties match the DuckLake
-connector's procedure.
+from it when it replaces data or sets `delete_on_failure`. The name and
+properties match the DuckLake connector's procedure.
 
 | Property | Meaning |
 | --- | --- |
@@ -1111,7 +1111,7 @@ connector's procedure.
 | `import_id` | Required. A stable identifier of the import, 1 to 128 letters, digits, underscores or hyphens. |
 | `expected_rows` | Refuses the statement unless the files to register hold exactly this many rows, counting files with no rows as zero. It is checked before any commit is sent, so `delete_on_failure` applies. `0` with no files is valid and ends the replaced days. Pass the row count of the export, so that a retry that finds the files already deleted fails instead of silently replacing the days with nothing. |
 | `allow_missing` | Allows a table column that a file lacks, when the column is nullable. Default `false`. |
-| `delete_on_failure` | With `location` only. Deletes the listed files when validation refuses any of them, before a commit is sent. Default `false`. |
+| `delete_on_failure` | With `location` only, restricted to a subdirectory inside the target table's namespace data path. Deletes unreferenced listed files when validation refuses any of them, before a commit is sent; files already registered in the catalog or under another table's write path are never deleted. Requires `DELETE` permission on the table. Default `false`. |
 | `replace` | Ends every data file of the table in the same snapshot. |
 | `replace_range_column`, `replace_range_start`, `replace_range_end` | Ends the data files of the days in `[start, end)`. All three are required together, and exclusive with `replace`. |
 

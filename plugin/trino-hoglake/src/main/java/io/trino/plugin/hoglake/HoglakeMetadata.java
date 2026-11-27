@@ -839,7 +839,7 @@ public class HoglakeMetadata
 
     /**
      * {@code add_files} needs the permission to insert into the table, and to delete from it
-     * when it replaces data, as DuckLake's does.
+     * when it replaces data or deletes refused files on failure.
      */
     @Override
     public Optional<ConnectorTableExecuteHandle> getTableHandleForExecute(
@@ -859,7 +859,7 @@ public class HoglakeMetadata
         }
         HoglakeTableHandle table = (HoglakeTableHandle) tableHandle;
         accessControl.checkCanInsertIntoTable(null, table.schemaTableName(), Optional.empty());
-        if (HoglakeAddFiles.replaces(properties)) {
+        if (HoglakeAddFiles.replaces(properties) || HoglakeAddFiles.deletesOnFailure(properties)) {
             accessControl.checkCanDeleteFromTable(null, table.schemaTableName(), Optional.empty());
         }
         return Optional.of(HoglakeAddFiles.plan(client, table, properties));
@@ -1054,9 +1054,14 @@ public class HoglakeMetadata
      * namespace, and it is where Hoglake's compaction writes the table's files.
      * CREATE TABLE AS keeps the {@code write_path} Hoglake prepares for the new table.
      */
+    static String namespaceDataPath(String catalogDataPath, String namespace)
+    {
+        return (catalogDataPath.endsWith("/") ? catalogDataPath : catalogDataPath + "/") + "data/" + namespace + "/";
+    }
+
     static String tableWritePath(String catalogDataPath, String namespace, String table)
     {
-        return (catalogDataPath.endsWith("/") ? catalogDataPath : catalogDataPath + "/") + "data/" + namespace + "/" + table + "/";
+        return namespaceDataPath(catalogDataPath, namespace) + table + "/";
     }
 
     private static List<HoglakeDtos.FileRegistration> decodeFragments(Collection<Slice> fragments)

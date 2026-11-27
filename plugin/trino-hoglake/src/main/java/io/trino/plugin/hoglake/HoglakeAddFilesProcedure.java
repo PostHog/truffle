@@ -47,7 +47,7 @@ public final class HoglakeAddFilesProcedure
                         stringProperty("import_id", "Stable identifier for retries of the same import", null, false),
                         longProperty("expected_rows", "Refuse unless the files to register hold exactly this many rows", null, false),
                         booleanProperty("allow_missing", "Read table columns that a file lacks as NULL when they are nullable", false, false),
-                        booleanProperty("delete_on_failure", "Delete the listed files when validation refuses them before any commit is sent", false, false),
+                        booleanProperty("delete_on_failure", "Delete unreferenced listed files when validation refuses them before any commit is sent", false, false),
                         booleanProperty("replace", "End every data file of the table in the registration snapshot", false, false),
                         stringProperty("replace_range_column", "Column of the day partition whose days the registration replaces", null, false),
                         stringProperty("replace_range_start", "Inclusive UTC day boundary", null, false),
