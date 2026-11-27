@@ -2005,7 +2005,6 @@ final class HoglakeDedicatedReadPath
                                         handle.tableUuid(),
                                         handle.snapshotId(),
                                         addFiles,
-                                        List.of(),
                                         addDvs));
                     }
                 });
@@ -2035,7 +2034,6 @@ final class HoglakeDedicatedReadPath
                                 handle.tableUuid(),
                                 handle.snapshot(),
                                 addFiles,
-                                List.of(),
                                 List.of()));
                 return null;
             });
@@ -2401,7 +2399,7 @@ final class HoglakeDedicatedReadPath
                 file.path(),
                 file.fileSizeBytes(),
                 file.recordCount(),
-                null);
+                file.footerSize() > 0 ? file.footerSize() : null);
     }
 
     private static HoglakeDtos.LocalAddDv toLocalAddDv(HoglakeReadSessionContext context, HoglakeDtos.DeleteRegistration dv)
